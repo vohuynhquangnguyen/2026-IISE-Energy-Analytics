@@ -1,11 +1,13 @@
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import torch
 
 from utils.dataloader import load_competition_data, temporal_split
 from evaluation.metrics import evaluate_all_metrics, long_df_to_matrix, rmse
 from models.sarimax import CountySARIMAX
 from models.seq2seq import Seq2SeqForecaster
+from models.dkl import DKLForecaster
 
 
 RESULTS_DIR = Path("results")
@@ -21,6 +23,26 @@ SEQ2SEQ_CONFIG = {
     "lr": 1e-3,
 }
 
+DKL_CONFIG = {
+    "lags": (1, 2, 3, 4, 5, 6, 12, 24, 48),
+    "rolling_windows": (6, 12, 24),
+    "hidden_dims": (256, 128, 64),
+    "embed_dim": 20,
+    "num_inducing": 768,
+    "dropout": 0.1,
+    "epochs": 40,
+    "batch_size": 1024,
+    "lr": 5e-3,
+    "max_train_rows": None,
+    "random_state": 42,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "clip_nonnegative": True,
+    "num_workers": 0,
+    "predict_batch_size": 4096,
+    "grad_clip_norm": 1.0,
+    "weather_lags": (1, 3, 6, 12, 24),
+    "weather_rolling_windows": (6, 12, 24),
+}
 
 def average_county_rmse(y_true_matrix, pred_df, locations, timestamps):
     """
@@ -255,6 +277,94 @@ def save_demo_predictions(
     print(f"[{model_name}] Saved demo predictions to {out_path}")
 
 
+def validate_dkl(split, locations, interval_method="conformal"):
+    print("Training DKL...")
+    model = DKLForecaster(**DKL_CONFIG)
+    model.fit(split.ds_train_sub)
+
+    if interval_method == "conformal":
+        print("Calibrating DKL conformal intervals...")
+        model.calibrate_intervals(
+            split.ds_train_sub,
+            calibration_size=48,
+            alpha=0.05,
+        )
+
+    pred_df = model.predict(
+        split.ds_train_sub,
+        split.val_timestamps_48h,
+        return_intervals=True,
+        alpha=0.05,
+        interval_method=interval_method,
+    )
+
+    demo_rmse, pred_matrix = average_county_rmse(
+        split.val_truth_48h,
+        pred_df,
+        locations,
+        split.val_timestamps_48h,
+    )
+
+    train_outages = (
+        split.ds_train_sub.out.transpose("timestamp", "location")
+        .values.astype(float)
+    )
+
+    lower_matrix = long_df_to_matrix(
+        pred_df,
+        "lower",
+        split.val_timestamps_48h,
+        locations,
+    )
+    upper_matrix = long_df_to_matrix(
+        pred_df,
+        "upper",
+        split.val_timestamps_48h,
+        locations,
+    )
+
+    comp_scores = evaluate_all_metrics(
+        train_outages=train_outages,
+        y_true=split.val_truth_48h,
+        y_pred=pred_matrix,
+        lower=lower_matrix,
+        upper=upper_matrix,
+    )
+
+    print_scores("DKL", demo_rmse, comp_scores)
+    return model, pred_df, comp_scores
+
+
+def save_dkl_demo_predictions(bundle, interval_method="conformal"):
+    if bundle.ds_test_48h is None:
+        print("[DKL] No test_48h_demo.nc found. Skipping demo test prediction.")
+        return
+
+    print("[DKL] Retraining on full training data...")
+    model = DKLForecaster(**DKL_CONFIG)
+    model.fit(bundle.ds_train)
+
+    if interval_method == "conformal":
+        print("[DKL] Calibrating conformal intervals on full training data...")
+        model.calibrate_intervals(
+            bundle.ds_train,
+            calibration_size=48,
+            alpha=0.05,
+        )
+
+    pred_df = model.predict(
+        bundle.ds_train,
+        bundle.test_48h_timestamps,
+        return_intervals=True,
+        alpha=0.05,
+        interval_method=interval_method,
+    )
+
+    out_path = RESULTS_DIR / "dkl_pred_48h.csv"
+    pred_df.to_csv(out_path, index=False)
+    print(f"[DKL] Saved demo predictions to {out_path}")
+
+
 def main():
     bundle = load_competition_data("data")
     split = temporal_split(bundle.ds_train, val_fraction=0.2)
@@ -273,10 +383,12 @@ def main():
     # Validation phase
     sarimax_model, sarimax_val_pred, sarimax_scores = validate_sarimax(split, locations)
     seq2seq_model, seq2seq_val_pred, seq2seq_scores, _ = validate_seq2seq(split, locations)
+    dkl_model, dkl_val_pred, dkl_scores = validate_dkl(split, locations, interval_method="conformal")
 
     # Save validation predictions
     sarimax_val_pred.to_csv(RESULTS_DIR / "sarimax_val_pred.csv", index=False)
     seq2seq_val_pred.to_csv(RESULTS_DIR / "seq2seq_val_pred.csv", index=False)
+    dkl_val_pred.to_csv(RESULTS_DIR / "dkl_val_pred.csv", index=False)
     print("\nSaved validation prediction files to results/")
 
     # Retrain on full train set for demo test inference
@@ -305,6 +417,8 @@ def main():
         seq2seq_q_by_county=seq2seq_q_full,
     )
 
+    # DKL demo test predictions
+    save_dkl_demo_predictions(bundle, interval_method="conformal")
 
 if __name__ == "__main__":
     main()
