@@ -345,10 +345,16 @@ def build_tabular_feature_row(
     else:
         feat["gust_x_out"] = 0.0
     feat["severity_x_out"] = feat["weather_severity"] * latest_out
-    feat["severity_x_momentum"] = feat["weather_severity"] * feat.get("out_diff_1", 0.0)
-    gust_diff = feat.get("w_gust_diff_1", 0.0)
-    feat["gust_diff_x_momentum"] = gust_diff * feat.get("out_diff_6", 0.0)
     feat["wind_sq_x_outrate"] = feat["wind_speed_sq"] * (latest_out / latest_tracked)
+
+    # Weather severity × outage momentum at every configured offset.
+    # Short offsets (1, 6) capture how severe weather amplifies rapid outage
+    # changes; longer offsets (48, 168) capture sustained weather impact.
+    gust_diff = feat.get("w_gust_diff_1", 0.0)
+    for offset in diff_offsets:
+        momentum = feat.get(f"out_diff_{offset}", 0.0)
+        feat[f"severity_x_momentum_{offset}"] = feat["weather_severity"] * momentum
+        feat[f"gust_diff_x_momentum_{offset}"] = gust_diff * momentum
 
     # ── Interaction terms: time × weather ───────────────────────────────
     feat["night_wind"] = is_night * wind_speed

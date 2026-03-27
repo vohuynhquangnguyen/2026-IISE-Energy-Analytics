@@ -21,7 +21,7 @@ features:
   # Each offset k produces out_diff_k = outage_now - outage_{k}_hours_ago.
   # Short offsets capture fast storm trends; longer offsets capture
   # multi-day (48h) and week-over-week (168h) changes.
-  diff_offsets: [1, 6, 12,24, 48, 168]
+  diff_offsets: [1, 6, 12, 24, 48, 168]
 
   # Key weather variables kept as raw features
   weather_subset:
