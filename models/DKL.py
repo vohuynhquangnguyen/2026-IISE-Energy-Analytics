@@ -154,6 +154,8 @@ class DKLForecaster:
         weather_lags: Iterable[int] = (1, 3, 6, 12, 24),
         # [ACTION 6] New: weather rolling windows — added 12
         weather_rolling_windows: Iterable[int] = (6, 12, 24),
+        lag_noise_frac: float = 0.3,
+        lag_noise_scale: float = 0.15,
     ):
         self.lags = tuple(sorted(set(int(x) for x in lags)))
         self.rolling_windows = tuple(sorted(set(int(x) for x in rolling_windows)))
@@ -188,6 +190,8 @@ class DKLForecaster:
         self.grad_clip_norm = float(grad_clip_norm)
         self.weather_lags = tuple(sorted(set(int(x) for x in weather_lags)))
         self.weather_rolling_windows = tuple(sorted(set(int(x) for x in weather_rolling_windows)))
+        self.lag_noise_frac = float(lag_noise_frac)
+        self.lag_noise_scale = float(lag_noise_scale)
 
         self.pin_memory = self.device.type == "cuda"
 
@@ -709,3 +713,128 @@ class DKLForecaster:
                 )
 
         return pd.DataFrame(all_rows)
+
+    # ================================================================== #
+    #  Oracle evaluation + noise-injection training + adaptive conformal  #
+    # ================================================================== #
+
+    @staticmethod
+    def _outage_col_mask(feature_columns: list[str]) -> np.ndarray:
+        """Boolean mask for columns that depend on past outage values."""
+        prefixes = (
+            "out_lag_", "outage_rate_lag_", "out_roll_mean_", "out_roll_max_",
+            "out_roll_std_", "out_last", "outage_rate",
+        )
+        return np.array(
+            [any(c.startswith(p) for p in prefixes) for c in feature_columns],
+            dtype=bool,
+        )
+
+    def build_feature_table(self, ds):
+        """Build features using actual ground-truth outage values."""
+        all_ts = pd.to_datetime(ds.timestamp.values)
+        self.weather_features_ = [str(x) for x in ds.feature.values]
+        X_df, y, locs = self._dataset_to_training_table(ds)
+        n_loc, n_t = len(ds.location.values), len(all_ts)
+        row_ts = np.array([
+            all_ts[t] for _ in range(n_loc)
+            for t in range(self.min_history, n_t)
+        ])
+        return X_df, y, row_ts, locs
+
+    def fit_from_arrays(self, X, y, val_X=None, val_y=None):
+        """Train from arrays with optional noise injection on outage-lag cols."""
+        X = np.nan_to_num(np.asarray(X, dtype=np.float32),
+                          nan=0.0, posinf=0.0, neginf=0.0)
+        y = np.nan_to_num(np.asarray(y, dtype=np.float32),
+                          nan=0.0, posinf=0.0, neginf=0.0)
+
+        if self.max_train_rows is not None and len(X) > self.max_train_rows:
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(len(X), size=self.max_train_rows, replace=False)
+            X, y = X[idx], y[idx]
+
+        # Noise injection on outage-lag columns
+        if self.lag_noise_frac > 0 and len(self.feature_columns_) > 0:
+            cmask = self._outage_col_mask(self.feature_columns_)
+            nc = cmask.sum()
+            if nc > 0:
+                rng = np.random.default_rng(self.random_state + 1)
+                nn = int(len(X) * self.lag_noise_frac)
+                rows = rng.choice(len(X), size=nn, replace=False)
+                stds = np.std(X[:, cmask], axis=0) + 1e-8
+                noise = rng.normal(0.0, self.lag_noise_scale * stds,
+                                   size=(nn, nc)).astype(np.float32)
+                X[np.ix_(rows, np.where(cmask)[0])] += noise
+                print(f"[DKL] noise: {nc} cols, {nn:,}/{len(X):,} samples")
+
+        X_scaled = self.x_scaler.fit_transform(X).astype(np.float32)
+        y_log = np.log1p(np.clip(y, 0.0, None)).astype(np.float32)
+        self.y_mean_ = float(y_log.mean())
+        self.y_std_ = float(y_log.std() + 1e-8)
+        y_scaled = ((y_log - self.y_mean_) / self.y_std_).astype(np.float32)
+
+        self.input_dim_ = X_scaled.shape[1]
+        self.model, self.likelihood = self._init_model(self.input_dim_)
+
+        dataset = TensorDataset(torch.tensor(X_scaled, dtype=torch.float32),
+                                torch.tensor(y_scaled, dtype=torch.float32))
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True,
+                            pin_memory=self.pin_memory, num_workers=self.num_workers,
+                            persistent_workers=(self.num_workers > 0))
+
+        self.model.train(); self.likelihood.train()
+        optimizer = torch.optim.Adam([
+            {"params": self.model.feature_extractor.parameters(), "lr": self.lr},
+            {"params": self.model.variational_parameters(), "lr": self.lr * 2},
+            {"params": self.model.mean_module.parameters(),  "lr": self.lr},
+            {"params": self.model.covar_module.parameters(),  "lr": self.lr},
+            {"params": self.likelihood.parameters(),          "lr": self.lr},
+        ])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.epochs, eta_min=self.lr * 0.01)
+        mll = gpytorch.mlls.VariationalELBO(
+            self.likelihood, self.model, num_data=len(dataset))
+
+        self.train_history_ = []
+        print(f"[DKL] device={self.device}, features={self.input_dim_}, "
+              f"samples={len(dataset)}")
+        for epoch in range(self.epochs):
+            t0 = time.time()
+            eloss, nb = 0.0, 0
+            for xb, yb in loader:
+                xb = xb.to(self.device, non_blocking=self.pin_memory)
+                yb = yb.to(self.device, non_blocking=self.pin_memory)
+                optimizer.zero_grad(set_to_none=True)
+                loss = -mll(self.model(xb), yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.grad_clip_norm)
+                optimizer.step()
+                eloss += loss.item(); nb += 1
+            scheduler.step()
+            avg = eloss / nb
+            self.train_history_.append(avg)
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                msg = (f"  epoch {epoch+1}/{self.epochs}  loss={avg:.4f}  "
+                       f"lr={scheduler.get_last_lr()[0]:.6f}  "
+                       f"{time.time()-t0:.1f}s")
+                if val_X is not None and val_y is not None:
+                    vr = self.predict_oracle(val_X)
+                    msg += (f"  val_rmse="
+                            f"{np.sqrt(np.mean((val_y - vr['mean'])**2)):.2f}")
+                print(msg)
+        return self
+
+    def predict_oracle(self, X, ci_multiplier=2.0):
+        """Single forward-pass prediction. Returns dict(mean, lower, upper)."""
+        if self.model is None:
+            raise ValueError("Model not fitted.")
+        X = np.nan_to_num(np.asarray(X, dtype=np.float32),
+                          nan=0.0, posinf=0.0, neginf=0.0)
+        ml, sl = self._predict_distribution(X)
+        return {
+            "mean":  np.clip(np.expm1(ml), 0, None),
+            "lower": np.clip(np.expm1(ml - ci_multiplier * sl), 0, None),
+            "upper": np.clip(np.expm1(ml + ci_multiplier * sl), 0, None),
+        }
