@@ -1,0 +1,135 @@
+# ============================================================================
+# DKL (Deep Kernel Learning) Configuration
+# ============================================================================
+# This file controls the architecture, feature engineering, and training
+# hyperparameters for the DKL model.  DKL combines a deep neural-network
+# feature extractor with a sparse variational Gaussian Process to produce
+# both point forecasts and calibrated prediction intervals.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Feature engineering — shared with all models via utils/feature_engineering.py
+# ---------------------------------------------------------------------------
+features:
+  # Outage lag steps used as input features (hours into the past)
+  lags: [1, 3, 6, 9, 12, 24, 48, 168]
+
+  # Rolling-window sizes (hours) for outage statistics (mean, max, std)
+  rolling_windows: [1, 3, 6, 9, 12, 24, 48, 168]
+
+  # First-difference offsets for outage momentum features.
+  # Each offset k produces out_diff_k = outage_now - outage_{k}_hours_ago.
+  # Short offsets capture fast storm trends; longer offsets capture
+  # multi-day (48h) and week-over-week (168h) changes.
+  diff_offsets: [1, 6, 12,24, 48, 168]
+
+  # Key weather variables kept as raw features
+  weather_subset:
+    - gust
+    - cape
+    - cape_1
+    - tp
+    - prate
+    - refc
+    - hail
+    - u10
+    - v10
+    - t2m
+    - mstav
+    - pwat
+    - sh2
+    - lftx
+    - blh
+    - sdlwrf
+    - sp
+    - tcc
+    - r2
+    - pcdb
+
+  # Weather variables used in rolling aggregations
+  rolling_weather_subset:
+    - gust
+    - cape
+    - tp
+    - prate
+    - t2m
+    - mstav
+
+  # Weather variables used for first-difference features
+  diff_weather_subset:
+    - gust
+    - cape
+    - t2m
+    - sp
+    - prate
+
+  # Lag steps for the key weather variables
+  weather_lags: [1, 3, 6, 9, 12, 24, 48, 168]
+
+  # Rolling-window sizes for weather aggregations
+  weather_rolling_windows: [1, 3, 6, 9, 12, 24, 48, 168]
+
+# ---------------------------------------------------------------------------
+# Neural-network feature extractor → Gaussian Process
+# ---------------------------------------------------------------------------
+model:
+  # Sizes of hidden layers in the MLP feature extractor
+  hidden_dims: [512, 256, 128, 64]
+
+  # Dimensionality of the embedding fed into the GP kernel
+  embed_dim: 32
+
+  # Number of inducing points for the sparse variational GP
+  num_inducing: 768
+
+  # Dropout probability in the feature extractor
+  dropout: 0.1
+
+  # Whether to clip predictions to be non-negative
+  clip_nonnegative: true
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  epochs: 40
+  batch_size: 1024
+  lr: 5.0e-3
+
+  # Maximum gradient norm (prevents GP-related gradient explosions)
+  grad_clip_norm: 1.0
+
+  # Cap on total training rows (null = use all data; matches colleague)
+  max_train_rows: null
+
+  # Reproducibility seed
+  random_state: 42
+
+  # Device selection: "cuda", "cpu", or "auto" (picks GPU if available)
+  device: auto
+
+  # DataLoader settings
+  num_workers: 0
+  predict_batch_size: 4096
+
+  # Noise injection on outage-lag columns during training
+  # (improves autoregressive robustness at test time)
+  lag_noise_frac: 0.3
+  lag_noise_scale: 0.15
+
+  # Early stopping patience (epochs without validation improvement)
+  early_stopping_patience: 10
+
+# ---------------------------------------------------------------------------
+# Prediction intervals
+# ---------------------------------------------------------------------------
+intervals:
+  # Method: "conformal" uses held-out residual calibration;
+  #         "posterior" uses the GP posterior variance directly.
+  method: conformal
+
+  # Significance level (0.05 → 95% PI)
+  alpha: 0.05
+
+  # Number of trailing timestamps used for conformal calibration
+  calibration_size: 48

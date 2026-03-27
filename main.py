@@ -1,307 +1,262 @@
+"""
+main.py
+=======
+Entry point for the IISE Energy Analytics competition pipeline.
+
+The pipeline is divided into three clearly separated phases:
+
+    Phase 1 — Configuration & Data Loading
+        Load YAML configs, read the NetCDF competition datasets, and print
+        a summary of the data.
+
+    Phase 2 — Walk-Forward Cross-Validation
+        For each enabled model, run *K* walk-forward folds (expanding-window
+        temporal CV) to evaluate forecasting performance and tune
+        hyperparameters without look-ahead bias.
+
+    Phase 3 — Test Inference
+        Retrain each model on the *full* training set and produce the 48-hour
+        forecast file required for competition submission.
+
+All feature engineering is centralised in ``utils/feature_engineering.py`` so
+that every model trains and validates on an identical feature set.
+
+Reference: demo.ipynb (organiser-provided baseline notebook).
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import torch
 
-from utils.dataloader import load_competition_data, temporal_split
-from evaluation.metrics import evaluate_all_metrics, long_df_to_matrix, rmse
+from utils.config import load_config
+from utils.data_loader import (
+    CompetitionData,
+    WalkForwardFold,
+    load_competition_data,
+    walk_forward_split,
+)
+from evaluation.metrics import (
+    evaluate_all_metrics,
+    long_df_to_matrix,
+    rmse,
+    CompetitionScores,
+)
 from models.sarimax import CountySARIMAX
 from models.seq2seq import Seq2SeqForecaster
 from models.dkl import DKLForecaster
 
 
-RESULTS_DIR = Path("results")
-RESULTS_DIR.mkdir(exist_ok=True)
+# =========================================================================== #
+#  Utility helpers                                                             #
+# =========================================================================== #
 
-SEQ2SEQ_CONFIG = {
-    "seq_len": 24,
-    "horizon": 48,
-    "hidden_dim": 64,
-    "num_layers": 1,
-    "batch_size": 64,
-    "epochs": 5,
-    "lr": 1e-3,
-}
-
-DKL_CONFIG = {
-    "lags": (1, 2, 3, 4, 5, 6, 12, 24, 48),
-    "rolling_windows": (6, 12, 24),
-    "hidden_dims": (256, 128, 64),
-    "embed_dim": 20,
-    "num_inducing": 768,
-    "dropout": 0.1,
-    "epochs": 40,
-    "batch_size": 1024,
-    "lr": 5e-3,
-    "max_train_rows": None,
-    "random_state": 42,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "clip_nonnegative": True,
-    "num_workers": 0,
-    "predict_batch_size": 4096,
-    "grad_clip_norm": 1.0,
-    "weather_lags": (1, 3, 6, 12, 24),
-    "weather_rolling_windows": (6, 12, 24),
-    "lag_noise_frac": 0.3,
-    "lag_noise_scale": 0.15,
-}
-
-def average_county_rmse(y_true_matrix, pred_df, locations, timestamps):
+def average_county_rmse(
+    y_true_matrix: np.ndarray,
+    pred_df: pd.DataFrame,
+    locations: list[str],
+    timestamps: pd.DatetimeIndex,
+) -> tuple[float, np.ndarray]:
     """
-    Demo-notebook style metric:
-    macro average of county-level RMSE over the validation horizon.
+    Compute the macro-averaged county-level RMSE (demo-notebook style).
+
+    Returns the average RMSE and the prediction matrix (T × C).
     """
     pred_matrix = long_df_to_matrix(
-        pred_df,
-        value_col="pred",
-        timestamps=timestamps,
-        locations=locations,
+        pred_df, value_col="pred", timestamps=timestamps, locations=locations,
     )
-
-    county_rmses = []
-    for i in range(len(locations)):
-        county_rmses.append(rmse(y_true_matrix[:, i], pred_matrix[:, i]))
+    county_rmses = [
+        rmse(y_true_matrix[:, i], pred_matrix[:, i])
+        for i in range(len(locations))
+    ]
     return float(np.nanmean(county_rmses)), pred_matrix
 
 
-def print_scores(model_name, demo_rmse, comp_scores):
-    print(f"\n[{model_name}] Validation results")
-    print(f"  Avg county RMSE (demo style): {demo_rmse:.4f}")
-    print(f"  Normal-case RMSE:             {comp_scores.s1_normal_rmse:.4f}")
-    print(f"  Tail RMSE:                    {comp_scores.s2_tail_rmse:.4f}")
-    print(f"  Nonzero-outage F1:            {comp_scores.s3_f1_nonzero:.4f}")
-    if np.isnan(comp_scores.s4_winkler_95):
-        print("  Winkler 95:                   NaN (no lower/upper intervals yet)")
-    else:
-        print(f"  Winkler 95:                   {comp_scores.s4_winkler_95:.4f}")
-
-
-def split_for_calibration(ds, cal_size=48):
+def add_quantile_intervals(
+    pred_df: pd.DataFrame,
+    q_by_county: np.ndarray,
+    locations: list[str],
+) -> pd.DataFrame:
     """
-    Split a historical dataset into:
-      - fit portion
-      - trailing calibration portion
-
-    The calibration block is used only to estimate interval widths.
-    """
-    n = ds.sizes["timestamp"]
-    if n <= cal_size:
-        raise ValueError(
-            f"Need more than cal_size={cal_size} timestamps, got n={n}."
-        )
-
-    ds_fit = ds.isel(timestamp=slice(0, n - cal_size))
-    ds_cal = ds.isel(timestamp=slice(n - cal_size, n))
-    return ds_fit, ds_cal
-
-
-def add_quantile_intervals(pred_df, q_by_county, locations):
-    """
-    Add lower/upper columns to a long prediction DataFrame using
-    county-specific absolute-residual quantiles.
+    Attach lower/upper columns to a long prediction DataFrame using
+    county-specific absolute-residual quantiles (conformal calibration).
     """
     q_map = {str(loc): float(q_by_county[i]) for i, loc in enumerate(locations)}
-
     out = pred_df.copy()
     out["location"] = out["location"].astype(str)
-    out["q"] = out["location"].map(q_map).astype(float)
-    out["lower"] = np.clip(out["pred"] - out["q"], 0, None)
-    out["upper"] = out["pred"] + out["q"]
-    out = out.drop(columns=["q"])
+    q_vals = out["location"].map(q_map).astype(float)
+    out["lower"] = np.clip(out["pred"] - q_vals, 0, None)
+    out["upper"] = out["pred"] + q_vals
     return out
 
 
-def estimate_seq2seq_interval_widths(ds, locations, model_config, q_level=0.95, cal_size=48):
-    """
-    Estimate county-specific interval half-widths for Seq2Seq
-    using a simple conformal-style calibration block.
-
-    Procedure:
-      1. hold out the last cal_size timestamps of ds as calibration
-      2. train Seq2Seq on the earlier portion
-      3. forecast the calibration horizon
-      4. compute county-wise q_level quantile of absolute residuals
-    """
-    ds_fit, ds_cal = split_for_calibration(ds, cal_size=cal_size)
-
-    cal_timestamps = pd.to_datetime(ds_cal.timestamp.values[: model_config["horizon"]])
-    cal_truth = (
-        ds_cal.out.transpose("timestamp", "location")
-        .isel(timestamp=slice(0, model_config["horizon"]))
-        .values.astype(float)
-    )
-
-    calib_model = Seq2SeqForecaster(**model_config)
-    calib_model.fit(ds_fit)
-
-    cal_pred_df = calib_model.predict(ds_fit, cal_timestamps)
-    cal_pred = long_df_to_matrix(
-        cal_pred_df,
-        value_col="pred",
-        timestamps=cal_timestamps,
-        locations=locations,
-    )
-
-    abs_resid = np.abs(cal_truth - cal_pred)  # shape (48, C)
-    q_by_county = np.quantile(abs_resid, q_level, axis=0)
-
-    return q_by_county
+def print_fold_header(fold: WalkForwardFold) -> None:
+    """Print a concise header for a walk-forward fold."""
+    n_train = fold.ds_train_sub.sizes["timestamp"]
+    n_val = len(fold.val_timestamps)
+    print(f"\n{'─' * 60}")
+    print(f"  Fold {fold.fold_idx}  │  train={n_train} ts  │  val={n_val} ts")
+    print(f"  val range: {fold.val_timestamps[0]} → {fold.val_timestamps[-1]}")
+    print(f"{'─' * 60}")
 
 
-def validate_sarimax(split, locations):
-    print("Training SARIMAX...")
-    model = CountySARIMAX(order=(1, 0, 1))
-    model.fit(split.ds_train_sub)
-
-    pred_df = model.predict(
-        split.val_timestamps_48h,
-        locations,
-        return_intervals=True,
-        alpha=0.05,
-    )
-
-    demo_rmse, pred_matrix = average_county_rmse(
-        split.val_truth_48h,
-        pred_df,
-        locations,
-        split.val_timestamps_48h,
-    )
-
-    train_outages = (
-        split.ds_train_sub.out.transpose("timestamp", "location")
-        .values.astype(float)
-    )
-
-    lower_matrix = long_df_to_matrix(
-        pred_df, "lower", split.val_timestamps_48h, locations
-    )
-    upper_matrix = long_df_to_matrix(
-        pred_df, "upper", split.val_timestamps_48h, locations
-    )
-
-    comp_scores = evaluate_all_metrics(
-        train_outages=train_outages,
-        y_true=split.val_truth_48h,
-        y_pred=pred_matrix,
-        lower=lower_matrix,
-        upper=upper_matrix,
-    )
-
-    print_scores("SARIMAX", demo_rmse, comp_scores)
-    return model, pred_df, comp_scores
-
-
-def validate_seq2seq(split, locations):
-    print("Estimating Seq2Seq interval widths from calibration block...")
-    q_by_county = estimate_seq2seq_interval_widths(
-        ds=split.ds_train_sub,
-        locations=locations,
-        model_config=SEQ2SEQ_CONFIG,
-        q_level=0.95,
-        cal_size=48,
-    )
-
-    print("Training Seq2Seq...")
-    model = Seq2SeqForecaster(**SEQ2SEQ_CONFIG)
-    model.fit(split.ds_train_sub)
-
-    # Use ds_train_sub as the historical context,
-    # matching the history-only forecasting logic from demo.ipynb.
-    pred_df = model.predict(split.ds_train_sub, split.val_timestamps_48h)
-    pred_df = add_quantile_intervals(pred_df, q_by_county, locations)
-
-    demo_rmse, pred_matrix = average_county_rmse(
-        split.val_truth_48h,
-        pred_df,
-        locations,
-        split.val_timestamps_48h,
-    )
-
-    train_outages = (
-        split.ds_train_sub.out.transpose("timestamp", "location")
-        .values.astype(float)
-    )
-
-    lower_matrix = long_df_to_matrix(
-        pred_df, "lower", split.val_timestamps_48h, locations
-    )
-    upper_matrix = long_df_to_matrix(
-        pred_df, "upper", split.val_timestamps_48h, locations
-    )
-
-    comp_scores = evaluate_all_metrics(
-        train_outages=train_outages,
-        y_true=split.val_truth_48h,
-        y_pred=pred_matrix,
-        lower=lower_matrix,
-        upper=upper_matrix,
-    )
-
-    print_scores("Seq2Seq", demo_rmse, comp_scores)
-    return model, pred_df, comp_scores, q_by_county
-
-
-def save_demo_predictions(
-    bundle,
-    model_name,
-    model,
-    is_seq2seq=False,
-    seq2seq_q_by_county=None,
-):
-    """
-    Retrain-on-full-train style prediction step, similar to demo.ipynb,
-    but saving interval columns too.
-    """
-    if bundle.ds_test_48h is None:
-        print(f"[{model_name}] No test_48h_demo.nc found. Skipping demo test prediction.")
-        return
-
-    test_timestamps = bundle.test_48h_timestamps
-    locations = bundle.locations
-
-    if is_seq2seq:
-        pred_df = model.predict(bundle.ds_train, test_timestamps)
-
-        if seq2seq_q_by_county is None:
-            raise ValueError("seq2seq_q_by_county must be provided for Seq2Seq interval output.")
-
-        pred_df = add_quantile_intervals(pred_df, seq2seq_q_by_county, locations)
+def print_scores(model_name: str, demo_rmse: float, scores: CompetitionScores) -> None:
+    """Pretty-print the competition metrics for one model on one fold."""
+    print(f"  [{model_name}] Avg county RMSE: {demo_rmse:.4f}")
+    print(f"    s1 Normal RMSE:  {scores.s1_normal_rmse:.4f}")
+    print(f"    s2 Tail RMSE:    {scores.s2_tail_rmse:.4f}")
+    print(f"    s3 F1 (nonzero): {scores.s3_f1_nonzero:.4f}")
+    if np.isnan(scores.s4_winkler_95):
+        print("    s4 Winkler 95:   NaN (no intervals)")
     else:
-        pred_df = model.predict(
-            test_timestamps,
-            locations,
-            return_intervals=True,
-            alpha=0.05,
+        print(f"    s4 Winkler 95:   {scores.s4_winkler_95:.4f}")
+
+
+def compute_competition_scores(
+    fold: WalkForwardFold,
+    pred_df: pd.DataFrame,
+    locations: list[str],
+) -> tuple[float, CompetitionScores]:
+    """
+    Evaluate a model's predictions on one walk-forward fold.
+
+    Returns (avg_county_rmse, CompetitionScores).
+    """
+    demo_rmse_val, pred_matrix = average_county_rmse(
+        fold.val_truth, pred_df, locations, fold.val_timestamps,
+    )
+
+    # Training outages needed for threshold computation (s1/s2)
+    train_outages = (
+        fold.ds_train_sub.out.transpose("timestamp", "location")
+        .values.astype(float)
+    )
+
+    # Extract interval matrices if present
+    lower_matrix = upper_matrix = None
+    if "lower" in pred_df.columns and "upper" in pred_df.columns:
+        lower_matrix = long_df_to_matrix(
+            pred_df, "lower", fold.val_timestamps, locations,
+        )
+        upper_matrix = long_df_to_matrix(
+            pred_df, "upper", fold.val_timestamps, locations,
         )
 
-    out_path = RESULTS_DIR / f"{model_name.lower()}_pred_48h.csv"
-    pred_df.to_csv(out_path, index=False)
-    print(f"[{model_name}] Saved demo predictions to {out_path}")
+    scores = evaluate_all_metrics(
+        train_outages=train_outages,
+        y_true=fold.val_truth,
+        y_pred=pred_matrix,
+        lower=lower_matrix,
+        upper=upper_matrix,
+    )
+    return demo_rmse_val, scores
 
 
-def validate_dkl(split, locations, interval_method="conformal"):
-    print("Training DKL...")
-    model = DKLForecaster(**DKL_CONFIG)
-    model.fit(split.ds_train_sub)
+# =========================================================================== #
+#  Per-model validation on a single fold                                       #
+# =========================================================================== #
 
-    # Get point predictions first (no intervals)
+def validate_sarimax_fold(
+    fold: WalkForwardFold,
+    locations: list[str],
+    model_cfg_path: str = "sarimax.yaml",
+) -> tuple[pd.DataFrame, CompetitionScores]:
+    """Train SARIMAX on one fold and return predictions + scores."""
+    model = CountySARIMAX.from_config(model_cfg_path)
+    model.fit(fold.ds_train_sub)
+
+    # Pass ds_future=fold.ds_val so that exogenous weather features
+    # can be extracted for the validation forecast horizon.
     pred_df = model.predict(
-        split.ds_train_sub,
-        split.val_timestamps_48h,
-        return_intervals=False,
+        fold.val_timestamps, locations,
+        return_intervals=True, alpha=model.alpha,
+        ds_future=fold.ds_val,
     )
 
-    demo_rmse, pred_matrix = average_county_rmse(
-        split.val_truth_48h,
-        pred_df,
-        locations,
-        split.val_timestamps_48h,
+    demo_rmse_val, scores = compute_competition_scores(fold, pred_df, locations)
+    print_scores("SARIMAX", demo_rmse_val, scores)
+    return pred_df, scores
+
+
+def validate_seq2seq_fold(
+    fold: WalkForwardFold,
+    locations: list[str],
+    model_cfg_path: str = "seq2seq.yaml",
+) -> tuple[pd.DataFrame, CompetitionScores]:
+    """Train Seq2Seq on one fold and return predictions + scores."""
+    cfg = load_config(model_cfg_path)
+    interval_cfg = cfg.get("intervals", {})
+    cal_size = interval_cfg.get("cal_size", 48)
+    q_level = interval_cfg.get("q_level", 0.95)
+
+    model = Seq2SeqForecaster.from_config(model_cfg_path)
+
+    # --- Conformal calibration: hold out trailing block from fold's train set ---
+    ds_train = fold.ds_train_sub
+    n_train = ds_train.sizes["timestamp"]
+
+    if n_train > cal_size + model.seq_len + model.horizon:
+        # Split fold's train into fit + calibration
+        ds_fit = ds_train.isel(timestamp=slice(0, n_train - cal_size))
+        ds_cal = ds_train.isel(timestamp=slice(n_train - cal_size, n_train))
+
+        cal_timestamps = pd.to_datetime(ds_cal.timestamp.values[: model.horizon])
+        cal_truth = (
+            ds_cal.out.transpose("timestamp", "location")
+            .isel(timestamp=slice(0, model.horizon))
+            .values.astype(float)
+        )
+
+        # Train calibration model and measure residuals
+        cal_model = Seq2SeqForecaster.from_config(model_cfg_path)
+        cal_model.fit(ds_fit)
+        cal_pred_df = cal_model.predict(ds_fit, cal_timestamps)
+        cal_pred = long_df_to_matrix(
+            cal_pred_df, value_col="pred",
+            timestamps=cal_timestamps, locations=locations,
+        )
+        abs_resid = np.abs(cal_truth - cal_pred)
+        q_by_county = np.quantile(abs_resid, q_level, axis=0)
+    else:
+        # Not enough data for calibration — fall back to no intervals
+        q_by_county = None
+
+    # --- Train the actual model on the full fold training set ---
+    model.fit(fold.ds_train_sub)
+    pred_df = model.predict(fold.ds_train_sub, fold.val_timestamps)
+
+    if q_by_county is not None:
+        pred_df = add_quantile_intervals(pred_df, q_by_county, locations)
+
+    demo_rmse_val, scores = compute_competition_scores(fold, pred_df, locations)
+    print_scores("Seq2Seq", demo_rmse_val, scores)
+    return pred_df, scores
+
+
+def validate_dkl_fold(
+    fold: WalkForwardFold,
+    locations: list[str],
+    model_cfg_path: str = "dkl.yaml",
+    alpha: float = 0.05,
+) -> tuple[pd.DataFrame, CompetitionScores]:
+    """Train DKL on one fold and return predictions + scores."""
+    model = DKLForecaster.from_config(model_cfg_path)
+    model.fit(fold.ds_train_sub)
+
+    # Point predictions (autoregressive)
+    pred_df = model.predict(
+        fold.ds_train_sub, fold.val_timestamps, return_intervals=False,
     )
 
     # Apply adaptive conformal intervals on the point predictions
-    y_true_flat = split.val_truth_48h.ravel()
-    pred_flat   = pred_matrix.ravel()
-    alpha = 0.05
+    _, pred_matrix = average_county_rmse(
+        fold.val_truth, pred_df, locations, fold.val_timestamps,
+    )
+
+    y_true_flat = fold.val_truth.ravel()
+    pred_flat = pred_matrix.ravel()
 
     residuals = np.abs(y_true_flat - pred_flat)
     n_cal = len(residuals)
@@ -312,314 +267,335 @@ def validate_dkl(split, locations, interval_method="conformal"):
     conf_lo = np.clip(pred_flat - conformal_q, 0, None).reshape(pred_matrix.shape)
     conf_hi = (pred_flat + conformal_q).reshape(pred_matrix.shape)
 
-    # Adaptive conformal
+    # Adaptive conformal (wider intervals for high-outage predictions)
     median_nz = np.median(pred_flat[pred_flat > 0]) if (pred_flat > 0).any() else 1.0
     adapt_q = np.where(pred_flat > median_nz, conformal_q * 1.5, conformal_q * 0.8)
     adapt_q = np.maximum(adapt_q, 5.0)
     adapt_lo = np.clip(pred_flat - adapt_q, 0, None).reshape(pred_matrix.shape)
     adapt_hi = (pred_flat + adapt_q).reshape(pred_matrix.shape)
 
-    # Pick best
-    conf_cov  = np.mean((y_true_flat >= conf_lo.ravel()) & (y_true_flat <= conf_hi.ravel()))
-    adapt_cov = np.mean((y_true_flat >= adapt_lo.ravel()) & (y_true_flat <= adapt_hi.ravel()))
-
+    # Pick the strategy with best Winkler among those meeting coverage ≥ 94%
     def _wk(lo, hi, yt):
-        return np.mean((hi-lo) + (2/alpha)*np.maximum(lo-yt,0) + (2/alpha)*np.maximum(yt-hi,0))
+        return np.mean(
+            (hi - lo)
+            + (2 / alpha) * np.maximum(lo - yt, 0)
+            + (2 / alpha) * np.maximum(yt - hi, 0)
+        )
 
-    conf_wk  = _wk(conf_lo.ravel(), conf_hi.ravel(), y_true_flat)
+    conf_cov = np.mean((y_true_flat >= conf_lo.ravel()) & (y_true_flat <= conf_hi.ravel()))
+    adapt_cov = np.mean((y_true_flat >= adapt_lo.ravel()) & (y_true_flat <= adapt_hi.ravel()))
+    conf_wk = _wk(conf_lo.ravel(), conf_hi.ravel(), y_true_flat)
     adapt_wk = _wk(adapt_lo.ravel(), adapt_hi.ravel(), y_true_flat)
 
-    print(f"\n  PI strategies: Fixed(cov={conf_cov:.3f}, wk={conf_wk:.1f}) "
+    print(f"  PI strategies: Fixed(cov={conf_cov:.3f}, wk={conf_wk:.1f}) "
           f"| Adaptive(cov={adapt_cov:.3f}, wk={adapt_wk:.1f})")
 
     if adapt_cov >= 0.94 and adapt_wk < conf_wk:
         lower_matrix, upper_matrix = adapt_lo, adapt_hi
-        print(f"  → Using: Adaptive Conformal")
+        print("  → Using: Adaptive Conformal")
     else:
         lower_matrix, upper_matrix = conf_lo, conf_hi
-        print(f"  → Using: Conformal (fixed)")
+        print("  → Using: Conformal (fixed)")
 
+    # Rebuild long-format DataFrame with intervals
     train_outages = (
-        split.ds_train_sub.out.transpose("timestamp", "location")
+        fold.ds_train_sub.out.transpose("timestamp", "location")
         .values.astype(float)
     )
-
-    comp_scores = evaluate_all_metrics(
+    scores = evaluate_all_metrics(
         train_outages=train_outages,
-        y_true=split.val_truth_48h,
+        y_true=fold.val_truth,
         y_pred=pred_matrix,
         lower=lower_matrix,
         upper=upper_matrix,
     )
+    demo_rmse_val = float(np.nanmean([
+        rmse(fold.val_truth[:, i], pred_matrix[:, i])
+        for i in range(len(locations))
+    ]))
+    print_scores("DKL", demo_rmse_val, scores)
 
-    print_scores("DKL", demo_rmse, comp_scores)
-    return model, pred_df, comp_scores
+    return pred_df, scores
 
 
-def validate_dkl_oracle(bundle, split, locations):
+# =========================================================================== #
+#  Walk-forward validation driver                                              #
+# =========================================================================== #
+
+def run_walk_forward_validation(
+    folds: list[WalkForwardFold],
+    locations: list[str],
+    enabled_models: list[str],
+    alpha: float = 0.05,
+) -> dict[str, list[CompetitionScores]]:
     """
-    Oracle evaluation — replicates the colleague's notebook cells 14-19.
+    Run walk-forward cross-validation for all enabled models.
 
-    Key differences from the autoregressive validate_dkl:
-    - Features built from ground-truth (no autoregressive loop)
-    - Split: last 48h for val, everything before for train (~97.8% train)
-    - No noise injection (fair comparison to colleague)
-    - Adaptive conformal intervals
+    Parameters
+    ----------
+    folds : list[WalkForwardFold]
+        Temporal folds generated by ``walk_forward_split``.
+    locations : list[str]
+        County identifiers.
+    enabled_models : list[str]
+        Which models to run (e.g. ["sarimax", "seq2seq", "dkl"]).
+    alpha : float
+        Significance level for prediction intervals.
+
+    Returns
+    -------
+    dict[str, list[CompetitionScores]]
+        Model name → list of per-fold scores.
     """
-    from sklearn.metrics import f1_score as sk_f1_score
+    all_scores: dict[str, list[CompetitionScores]] = {m: [] for m in enabled_models}
 
+    for fold in folds:
+        print_fold_header(fold)
+
+        if "sarimax" in enabled_models:
+            print("\n  Training SARIMAX...")
+            _, scores = validate_sarimax_fold(fold, locations)
+            all_scores["sarimax"].append(scores)
+
+        if "seq2seq" in enabled_models:
+            print("\n  Training Seq2Seq...")
+            _, scores = validate_seq2seq_fold(fold, locations)
+            all_scores["seq2seq"].append(scores)
+
+        if "dkl" in enabled_models:
+            print("\n  Training DKL...")
+            _, scores = validate_dkl_fold(fold, locations, alpha=alpha)
+            all_scores["dkl"].append(scores)
+
+    return all_scores
+
+
+def print_cv_summary(all_scores: dict[str, list[CompetitionScores]]) -> None:
+    """Print a summary table of walk-forward CV results averaged across folds."""
     print("\n" + "=" * 70)
-    print("DKL ORACLE EVALUATION  (colleague's methodology)")
+    print("  WALK-FORWARD CROSS-VALIDATION SUMMARY (mean ± std across folds)")
     print("=" * 70)
 
-    # 1) Build features from full dataset using actual ground-truth values
-    print("[DKL-oracle] Building feature table...")
-    oracle_config = dict(DKL_CONFIG)
-    oracle_config["lag_noise_frac"] = 0.0  # No noise for fair comparison
-    model = DKLForecaster(**oracle_config)
-    model.locations_ = [str(loc) for loc in bundle.ds_train.location.values]
-    X_df, y, row_ts, row_locs = model.build_feature_table(bundle.ds_train)
-    model.feature_columns_ = X_df.columns.tolist()
-    X_all = X_df.values.astype(np.float32)
-    print(f"  Total: {len(y):,} samples, {X_all.shape[1]} features")
-
-    # 2) Split: last 48 timestamps for val (matching colleague's cell 14)
-    all_timestamps = pd.to_datetime(bundle.ds_train.timestamp.values)
-    val_start = all_timestamps[-48]
-    val_end   = all_timestamps[-1]
-
-    train_mask = row_ts < val_start
-    val_mask   = (row_ts >= val_start) & (row_ts <= val_end)
-
-    X_train, y_train = X_all[train_mask], y[train_mask]
-    X_val,   y_val   = X_all[val_mask],   y[val_mask]
-    val_locs_arr     = row_locs[val_mask]
-
-    # Drop rows with NaN in lag-48 columns (same as colleague's cell 14)
-    lag48_idx = [i for i, c in enumerate(model.feature_columns_) if "lag_48" in c]
-    if lag48_idx:
-        tv = ~np.isnan(X_train[:, lag48_idx]).any(axis=1)
-        vv = ~np.isnan(X_val[:, lag48_idx]).any(axis=1)
-        X_train, y_train = X_train[tv], y_train[tv]
-        X_val, y_val     = X_val[vv], y_val[vv]
-        val_locs_arr     = val_locs_arr[vv]
-
-    print(f"  Train: {len(y_train):,}  Val: {len(y_val):,}")
-    print(f"  Val period: {val_start} to {val_end}")
-
-    # 3) Train (no noise injection)
-    model.fit_from_arrays(X_train, y_train, val_X=X_val, val_y=y_val)
-
-    # 4) Get point predictions
-    pred_val = model.predict_oracle(X_val, ci_multiplier=2.0)["mean"]
-
-    # ================================================================ #
-    #  CONFORMAL + ADAPTIVE CONFORMAL  (colleague's cell 18)           #
-    # ================================================================ #
-    alpha = 0.05
-    residuals = np.abs(y_val - pred_val)
-
-    # Fixed conformal
-    n_cal = len(residuals)
-    conformal_level = min(np.ceil((1 - alpha) * (n_cal + 1)) / n_cal, 1.0)
-    conformal_q = np.quantile(residuals, conformal_level)
-
-    conf_lo = np.clip(pred_val - conformal_q, 0, None)
-    conf_hi = pred_val + conformal_q
-    conf_cov = np.mean((y_val >= conf_lo) & (y_val <= conf_hi))
-    conf_wk  = np.mean(
-        (conf_hi - conf_lo)
-        + (2/alpha) * np.maximum(conf_lo - y_val, 0)
-        + (2/alpha) * np.maximum(y_val - conf_hi, 0)
-    )
-
-    # Adaptive conformal (colleague's approach)
-    median_nz = np.median(pred_val[pred_val > 0]) if (pred_val > 0).any() else 1.0
-    adapt_q = np.where(
-        pred_val > median_nz,
-        conformal_q * 1.5,
-        conformal_q * 0.8,
-    )
-    adapt_q = np.maximum(adapt_q, 5.0)
-
-    adapt_lo = np.clip(pred_val - adapt_q, 0, None)
-    adapt_hi = pred_val + adapt_q
-    adapt_cov = np.mean((y_val >= adapt_lo) & (y_val <= adapt_hi))
-    adapt_wk  = np.mean(
-        (adapt_hi - adapt_lo)
-        + (2/alpha) * np.maximum(adapt_lo - y_val, 0)
-        + (2/alpha) * np.maximum(y_val - adapt_hi, 0)
-    )
-
-    # Choose best strategy
-    print("\n=== PI Strategy Comparison ===")
-    strategies = {
-        "Conformal (fixed)":    (conf_lo,  conf_hi,  conf_cov,  conf_wk),
-        "Adaptive Conformal":   (adapt_lo, adapt_hi, adapt_cov, adapt_wk),
-    }
-    best_name, best_wk = None, float("inf")
-    for name, (lo, hi, cov, wk) in strategies.items():
-        tag = "✓" if cov >= 0.94 else "✗"
-        print(f"  {tag} {name}: coverage={cov:.4f}, Winkler={wk:.2f}")
-        if cov >= 0.94 and wk < best_wk:
-            best_wk = wk
-            best_name = name
-
-    if best_name is None:
-        best_name = "Conformal (fixed)"
-    print(f"  → Using: {best_name}")
-
-    lower, upper = strategies[best_name][0], strategies[best_name][1]
-    pred = pred_val
-
-    # Enforce constraints
-    upper = np.maximum(upper, lower + 1)
-    lower = np.minimum(lower, pred)
-    upper = np.maximum(upper, pred)
-
-    # 5) Compute competition metrics — threshold from ALL data before val
-    train_out_all = (
-        bundle.ds_train.out.transpose("timestamp", "location")
-        .isel(timestamp=slice(0, len(all_timestamps) - 48))
-        .values.astype(float)
-    )
-    tau = np.quantile(train_out_all, 0.95, axis=0)
-    loc_idx = {str(loc): i for i, loc in enumerate(locations)}
-
-    s1_list, s2_list = [], []
-    for loc in locations:
-        m = val_locs_arr == loc
-        if m.sum() == 0:
+    for model_name, fold_scores in all_scores.items():
+        if not fold_scores:
             continue
-        yt, yp = y_val[m], pred[m]
-        c = loc_idx[loc]
-        norm = yt < tau[c]
-        if norm.sum() > 0:
-            s1_list.append(np.sqrt(np.mean((yt[norm] - yp[norm])**2)))
-        ext = yt >= tau[c]
-        if ext.sum() > 0:
-            s2_list.append(np.sqrt(np.mean((yt[ext] - yp[ext])**2)))
+        s1 = [s.s1_normal_rmse for s in fold_scores]
+        s2 = [s.s2_tail_rmse for s in fold_scores]
+        s3 = [s.s3_f1_nonzero for s in fold_scores]
+        s4 = [s.s4_winkler_95 for s in fold_scores if not np.isnan(s.s4_winkler_95)]
 
-    z_true = (y_val >= 1).astype(int)
-    z_pred = (pred >= 1).astype(int)
-    s3 = sk_f1_score(z_true, z_pred)
-    best_f1, best_t = s3, 1.0
-    for t in np.arange(0.1, 3.0, 0.1):
-        f = sk_f1_score(z_true, (pred >= t).astype(int))
-        if f > best_f1:
-            best_f1, best_t = f, t
-
-    winkler = (upper - lower) \
-        + (2/alpha)*np.maximum(lower - y_val, 0) \
-        + (2/alpha)*np.maximum(y_val - upper, 0)
-    coverage = np.mean((y_val >= lower) & (y_val <= upper))
-
-    print("\n" + "=" * 60)
-    print("DKL ORACLE — VALIDATION RESULTS")
-    print(f"(PI method: {best_name})")
-    print("=" * 60)
-    print(f"s1 (Normal RMSE):   {np.mean(s1_list):.4f}")
-    print(f"s2 (Extreme RMSE):  {np.mean(s2_list):.4f}")
-    print(f"s3 (F1 Detection):  {best_f1:.4f}")
-    print(f"s4 (Winkler Score): {np.mean(winkler):.4f}")
-    print(f"PI Coverage:        {coverage:.4f}")
-    print(f"Mean PI width:      {np.mean(upper - lower):.2f}")
-    print(f"Overall RMSE:       {np.sqrt(np.mean((y_val - pred)**2)):.4f}")
-    print(f"Conformal quantile: {conformal_q:.2f}")
-
-    return model, {"mean": pred, "lower": lower, "upper": upper,
-                    "conformal_q": conformal_q, "pi_method": best_name}
+        print(f"\n  {model_name.upper()} ({len(fold_scores)} folds)")
+        print(f"    s1 Normal RMSE:  {np.mean(s1):.4f} ± {np.std(s1):.4f}")
+        print(f"    s2 Tail RMSE:    {np.mean(s2):.4f} ± {np.std(s2):.4f}")
+        print(f"    s3 F1 (nonzero): {np.mean(s3):.4f} ± {np.std(s3):.4f}")
+        if s4:
+            print(f"    s4 Winkler 95:   {np.mean(s4):.4f} ± {np.std(s4):.4f}")
+        else:
+            print("    s4 Winkler 95:   N/A")
+    print()
 
 
-def save_dkl_demo_predictions(bundle, interval_method="conformal"):
+# =========================================================================== #
+#  Phase 3: Test inference helpers                                             #
+# =========================================================================== #
+
+def retrain_and_predict_sarimax(
+    bundle: CompetitionData,
+    results_dir: Path,
+) -> None:
+    """Retrain SARIMAX on the full training set and save test predictions."""
     if bundle.ds_test_48h is None:
-        print("[DKL] No test_48h_demo.nc found. Skipping demo test prediction.")
+        print("[SARIMAX] No test set found — skipping.")
         return
 
-    print("[DKL] Retraining on full training data...")
-    model = DKLForecaster(**DKL_CONFIG)
+    print("[SARIMAX] Retraining on full training data...")
+    model = CountySARIMAX.from_config("sarimax.yaml")
     model.fit(bundle.ds_train)
 
-    if interval_method == "conformal":
-        print("[DKL] Calibrating conformal intervals on full training data...")
+    # Pass ds_future=bundle.ds_test_48h so that exogenous weather features
+    # can be extracted for the 48-hour test forecast horizon.
+    pred_df = model.predict(
+        bundle.test_48h_timestamps, bundle.locations,
+        return_intervals=True, alpha=model.alpha,
+        ds_future=bundle.ds_test_48h,
+    )
+    out_path = results_dir / "sarimax_pred_48h.csv"
+    pred_df.to_csv(out_path, index=False)
+    print(f"[SARIMAX] Saved → {out_path}")
+
+
+def retrain_and_predict_seq2seq(
+    bundle: CompetitionData,
+    results_dir: Path,
+) -> None:
+    """Retrain Seq2Seq on the full training set and save test predictions."""
+    if bundle.ds_test_48h is None:
+        print("[Seq2Seq] No test set found — skipping.")
+        return
+
+    cfg = load_config("seq2seq.yaml")
+    interval_cfg = cfg.get("intervals", {})
+    cal_size = interval_cfg.get("cal_size", 48)
+    q_level = interval_cfg.get("q_level", 0.95)
+
+    # Estimate interval widths via conformal calibration on full train data
+    print("[Seq2Seq] Calibrating intervals...")
+    model_cfg = Seq2SeqForecaster.from_config("seq2seq.yaml")
+    ds_train = bundle.ds_train
+    n = ds_train.sizes["timestamp"]
+
+    ds_fit = ds_train.isel(timestamp=slice(0, n - cal_size))
+    ds_cal = ds_train.isel(timestamp=slice(n - cal_size, n))
+
+    cal_timestamps = pd.to_datetime(ds_cal.timestamp.values[: model_cfg.horizon])
+    cal_truth = (
+        ds_cal.out.transpose("timestamp", "location")
+        .isel(timestamp=slice(0, model_cfg.horizon))
+        .values.astype(float)
+    )
+
+    cal_model = Seq2SeqForecaster.from_config("seq2seq.yaml")
+    cal_model.fit(ds_fit)
+    cal_pred_df = cal_model.predict(ds_fit, cal_timestamps)
+    cal_pred = long_df_to_matrix(
+        cal_pred_df, value_col="pred",
+        timestamps=cal_timestamps, locations=bundle.locations,
+    )
+    q_by_county = np.quantile(np.abs(cal_truth - cal_pred), q_level, axis=0)
+
+    # Train on full data and predict
+    print("[Seq2Seq] Retraining on full training data...")
+    model = Seq2SeqForecaster.from_config("seq2seq.yaml")
+    model.fit(bundle.ds_train)
+
+    pred_df = model.predict(bundle.ds_train, bundle.test_48h_timestamps)
+    pred_df = add_quantile_intervals(pred_df, q_by_county, bundle.locations)
+
+    out_path = results_dir / "seq2seq_pred_48h.csv"
+    pred_df.to_csv(out_path, index=False)
+    print(f"[Seq2Seq] Saved → {out_path}")
+
+
+def retrain_and_predict_dkl(
+    bundle: CompetitionData,
+    results_dir: Path,
+) -> None:
+    """Retrain DKL on the full training set and save test predictions."""
+    if bundle.ds_test_48h is None:
+        print("[DKL] No test set found — skipping.")
+        return
+
+    dkl_cfg = load_config("dkl.yaml")
+    interval_cfg = dkl_cfg.get("intervals", {})
+
+    print("[DKL] Retraining on full training data...")
+    model = DKLForecaster.from_config("dkl.yaml")
+    model.fit(bundle.ds_train)
+
+    if interval_cfg.get("method", "conformal") == "conformal":
+        print("[DKL] Calibrating conformal intervals...")
         model.calibrate_intervals(
             bundle.ds_train,
-            calibration_size=48,
-            alpha=0.05,
+            calibration_size=interval_cfg.get("calibration_size", 48),
+            alpha=interval_cfg.get("alpha", 0.05),
         )
 
     pred_df = model.predict(
-        bundle.ds_train,
-        bundle.test_48h_timestamps,
+        bundle.ds_train, bundle.test_48h_timestamps,
         return_intervals=True,
-        alpha=0.05,
-        interval_method=interval_method,
+        alpha=interval_cfg.get("alpha", 0.05),
+        interval_method=interval_cfg.get("method", "conformal"),
     )
 
-    out_path = RESULTS_DIR / "dkl_pred_48h.csv"
+    out_path = results_dir / "dkl_pred_48h.csv"
     pred_df.to_csv(out_path, index=False)
-    print(f"[DKL] Saved demo predictions to {out_path}")
+    print(f"[DKL] Saved → {out_path}")
 
 
-def main():
-    bundle = load_competition_data("data")
-    split = temporal_split(bundle.ds_train, val_fraction=0.2)
+# =========================================================================== #
+#  Main entry point                                                            #
+# =========================================================================== #
 
-    print("Dataset summary")
-    print(f"  Train timestamps:   {bundle.ds_train.sizes['timestamp']}")
-    print(f"  Counties:           {bundle.ds_train.sizes['location']}")
-    print(f"  Weather features:   {bundle.ds_train.sizes['feature']}")
-    print(f"  Train split size:   {split.ds_train_sub.sizes['timestamp']}")
-    print(f"  Validation size:    {split.ds_val.sizes['timestamp']}")
-    print(f"  Validation horizon: {len(split.val_timestamps_48h)}")
+def main() -> None:
+    """
+    Full pipeline: config → data → walk-forward CV → test inference.
+    """
+    # ================================================================== #
+    #  Phase 1: Configuration & Data Loading                              #
+    # ================================================================== #
+    print("=" * 70)
+    print("  Phase 1: Configuration & Data Loading")
+    print("=" * 70)
+
+    pipeline_cfg = load_config("pipeline.yaml")
+    data_cfg = pipeline_cfg.get("data", {})
+    wf_cfg = pipeline_cfg.get("walk_forward", {})
+    enabled_models = pipeline_cfg.get("models", ["sarimax", "seq2seq", "dkl"])
+    alpha = pipeline_cfg.get("intervals", {}).get("alpha", 0.05)
+
+    results_dir = Path(pipeline_cfg.get("results_dir", "results"))
+    results_dir.mkdir(exist_ok=True)
+
+    # Load competition data
+    bundle = load_competition_data(
+        data_dir=data_cfg.get("data_dir", "data"),
+        train_file=data_cfg.get("train_file", "train.nc"),
+        test_48h_file=data_cfg.get("test_48h_file", "test_48h_demo.nc"),
+    )
+
+    print(f"\n  Dataset summary")
+    print(f"    Train timestamps: {bundle.ds_train.sizes['timestamp']}")
+    print(f"    Counties:         {bundle.ds_train.sizes['location']}")
+    print(f"    Weather features: {bundle.ds_train.sizes['feature']}")
+    print(f"    Enabled models:   {enabled_models}")
     print()
 
-    locations = bundle.locations
+    # ================================================================== #
+    #  Phase 2: Walk-Forward Cross-Validation                             #
+    # ================================================================== #
+    print("=" * 70)
+    print("  Phase 2: Walk-Forward Cross-Validation")
+    print("=" * 70)
 
-    # Validation phase
-    sarimax_model, sarimax_val_pred, sarimax_scores = validate_sarimax(split, locations)
-    seq2seq_model, seq2seq_val_pred, seq2seq_scores, _ = validate_seq2seq(split, locations)
-    dkl_model, dkl_val_pred, dkl_scores = validate_dkl(split, locations, interval_method="conformal")
+    folds = walk_forward_split(
+        bundle.ds_train,
+        n_folds=wf_cfg.get("n_folds", 3),
+        horizon=wf_cfg.get("horizon", 48),
+        min_train_frac=wf_cfg.get("min_train_frac", 0.5),
+    )
+    print(f"\n  Created {len(folds)} walk-forward folds "
+          f"(horizon={wf_cfg.get('horizon', 48)} hours)")
 
-    # Oracle evaluation with adaptive conformal — comparable to colleague's notebook
-    dkl_oracle_model, dkl_oracle_results = validate_dkl_oracle(
-        bundle, split, locations
+    all_scores = run_walk_forward_validation(
+        folds=folds,
+        locations=bundle.locations,
+        enabled_models=enabled_models,
+        alpha=alpha,
     )
 
-    # Save validation predictions
-    sarimax_val_pred.to_csv(RESULTS_DIR / "sarimax_val_pred.csv", index=False)
-    seq2seq_val_pred.to_csv(RESULTS_DIR / "seq2seq_val_pred.csv", index=False)
-    dkl_val_pred.to_csv(RESULTS_DIR / "dkl_val_pred.csv", index=False)
-    print("\nSaved validation prediction files to results/")
+    print_cv_summary(all_scores)
 
-    # Retrain on full train set for demo test inference
-    print("\nRetraining models on full training data for demo test prediction...")
+    # ================================================================== #
+    #  Phase 3: Test Inference                                             #
+    # ================================================================== #
+    print("=" * 70)
+    print("  Phase 3: Test Inference (retrain on full training data)")
+    print("=" * 70)
+    print()
 
-    sarimax_full = CountySARIMAX(order=(1, 0, 1))
-    sarimax_full.fit(bundle.ds_train)
-    save_demo_predictions(bundle, "SARIMAX", sarimax_full, is_seq2seq=False)
+    if "sarimax" in enabled_models:
+        retrain_and_predict_sarimax(bundle, results_dir)
 
-    # Estimate Seq2Seq interval widths from a calibration split on full training data
-    seq2seq_q_full = estimate_seq2seq_interval_widths(
-        ds=bundle.ds_train,
-        locations=locations,
-        model_config=SEQ2SEQ_CONFIG,
-        q_level=0.95,
-        cal_size=48,
-    )
+    if "seq2seq" in enabled_models:
+        retrain_and_predict_seq2seq(bundle, results_dir)
 
-    seq2seq_full = Seq2SeqForecaster(**SEQ2SEQ_CONFIG)
-    seq2seq_full.fit(bundle.ds_train)
-    save_demo_predictions(
-        bundle,
-        "Seq2Seq",
-        seq2seq_full,
-        is_seq2seq=True,
-        seq2seq_q_by_county=seq2seq_q_full,
-    )
+    if "dkl" in enabled_models:
+        retrain_and_predict_dkl(bundle, results_dir)
 
-    # DKL demo test predictions
-    save_dkl_demo_predictions(bundle, interval_method="conformal")
+    print("\n" + "=" * 70)
+    print("  Pipeline complete.  Results saved to:", results_dir)
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     main()
