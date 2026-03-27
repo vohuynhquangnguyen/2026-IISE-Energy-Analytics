@@ -626,9 +626,9 @@ def build_sarimax_exog(
 
     Returns
     -------
-    np.ndarray or None
-        Shape (T, n_features).  Returns ``None`` if no features were
-        requested (both weather and temporal disabled).
+    pd.DataFrame or None
+        Shape (T, n_features) with named columns.  Returns ``None`` if no
+        features were requested (both weather and temporal disabled).
     """
     if timestamps is None:
         timestamps = pd.to_datetime(ds.timestamp.values)
@@ -669,5 +669,5 @@ def build_sarimax_exog(
         return None
 
     exog_df = pd.concat(frames, axis=1)
-    return exog_df.values.astype(float)
+    return exog_df
 
