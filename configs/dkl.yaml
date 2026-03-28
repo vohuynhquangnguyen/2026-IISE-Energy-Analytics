@@ -110,7 +110,11 @@ training:
 
   # DataLoader settings
   num_workers: 0
+<<<<<<< Updated upstream
   predict_batch_size: 4096
+=======
+  predict_batch_size: 256
+>>>>>>> Stashed changes
 
   # Noise injection on outage-lag columns during training
   # (improves autoregressive robustness at test time)
@@ -133,3 +137,11 @@ intervals:
 
   # Number of trailing timestamps used for conformal calibration
   calibration_size: 48
+
+  # Per-horizon normalized conformal settings (improvements 1+2+3)
+  # These control the PerHorizonConformal pipeline which combines:
+  #   1. Normalized conformal (GP std as score normalizer)
+  #   2. Log-space calibration (expm1 back-transform)
+  #   3. Per-horizon ACI (adaptive alpha per step-ahead)
+  per_horizon_window: 300      # Rolling window size for residual pools
+  aci_learning_rate: 0.005     # ACI step size (higher = more adaptive)

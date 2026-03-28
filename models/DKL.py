@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -149,6 +150,175 @@ class DKLCalibration:
     """County-specific conformal interval half-widths."""
     q_by_county: np.ndarray
     alpha: float = 0.05
+
+
+# =========================================================================== #
+#  Per-Horizon Normalized Conformal with ACI (improvements 1+2+3)              #
+# =========================================================================== #
+
+class PerHorizonConformal:
+    """
+    Combines three high-impact improvements for DKL prediction intervals:
+
+    1. **Normalized conformal** — uses GP posterior std as the score normalizer,
+       producing variable-width intervals (tight where confident, wide where
+       uncertain): score_i = |y_i - mu_i| / sigma_i.
+
+    2. **Log-space calibration** — calibrates in log1p space and back-transforms
+       via expm1(), yielding naturally asymmetric intervals that match the
+       heavy-tailed outage distribution.
+
+    3. **Per-horizon calibration with ACI** — maintains separate residual pools
+       and adaptive alpha per forecast step-ahead, so intervals naturally widen
+       with horizon.  Adaptive Conformal Inference (Gibbs & Candes 2021) adjusts
+       the effective significance level based on recent miscoverage.
+
+    All three compose: normalized scores in log-space, stored per-horizon,
+    with ACI alpha adaptation.
+    """
+
+    def __init__(
+        self,
+        horizon: int = 48,
+        alpha: float = 0.05,
+        window: int = 300,
+        aci_lr: float = 0.005,
+    ):
+        self.horizon = horizon
+        self.base_alpha = alpha
+        self.aci_lr = aci_lr
+        # Separate residual pools per horizon step (signed normalized residuals)
+        self.residuals: dict[int, deque] = {
+            h: deque(maxlen=window) for h in range(horizon)
+        }
+        # Adaptive alpha per horizon step (ACI)
+        self.alpha_h: dict[int, float] = {h: alpha for h in range(horizon)}
+
+    def update(
+        self,
+        log_preds: np.ndarray,
+        log_stds: np.ndarray,
+        log_actuals: np.ndarray,
+    ) -> None:
+        """
+        Feed in one complete forecast cycle (up to horizon steps).
+
+        All inputs are in log1p space.  ``log_stds`` comes from the GP
+        posterior and is used to normalize residuals.
+
+        Parameters
+        ----------
+        log_preds : array, shape (H,) or (H, C)
+            Predicted means in log1p space.
+        log_stds : array, shape (H,) or (H, C)
+            Predicted GP std in log1p space.
+        log_actuals : array, shape (H,) or (H, C)
+            Actual values in log1p space.
+        """
+        n_steps = min(len(log_preds), self.horizon)
+        for h in range(n_steps):
+            p = np.atleast_1d(log_preds[h])
+            s = np.atleast_1d(log_stds[h])
+            a = np.atleast_1d(log_actuals[h])
+            # Signed normalized residuals (in log-space)
+            signed_norm = (a - p) / np.maximum(s, 1e-6)
+            for val in signed_norm.ravel():
+                self.residuals[h].append(float(val))
+
+    def get_intervals(
+        self,
+        log_preds: np.ndarray,
+        log_stds: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return calibrated prediction intervals in *original* (count) space.
+
+        Uses per-horizon asymmetric quantiles of signed normalized residuals,
+        computed in log-space, then back-transformed via expm1().
+
+        Parameters
+        ----------
+        log_preds : array, shape (H,) or (H, C)
+            Predicted means in log1p space.
+        log_stds : array, shape (H,) or (H, C)
+            GP posterior std in log1p space.
+
+        Returns
+        -------
+        lower, upper : arrays in original count space
+        """
+        H = min(len(log_preds), self.horizon)
+        lower = np.zeros_like(log_preds[:H], dtype=float)
+        upper = np.zeros_like(log_preds[:H], dtype=float)
+
+        for h in range(H):
+            res = np.array(self.residuals[h])
+            n = len(res)
+
+            # If insufficient data for this horizon, pool from nearby
+            if n < 20:
+                nearby: list[float] = []
+                for hh in range(max(0, h - 3), min(self.horizon, h + 4)):
+                    nearby.extend(self.residuals[hh])
+                res = np.array(nearby)
+                n = len(res)
+
+            if n < 5:
+                # Extreme fallback: use 2× GP std
+                log_lo = log_preds[h] - 2.0 * log_stds[h]
+                log_hi = log_preds[h] + 2.0 * log_stds[h]
+            else:
+                a = self.alpha_h[h]
+                # Asymmetric quantiles of signed normalized residuals
+                q_lo = np.quantile(res, a / 2)
+                q_hi = np.quantile(res, min(np.ceil((n + 1) * (1 - a / 2)) / n, 1.0))
+                # Intervals in log-space (naturally asymmetric after expm1)
+                log_lo = log_preds[h] + q_lo * log_stds[h]
+                log_hi = log_preds[h] + q_hi * log_stds[h]
+
+            # Back-transform to original space
+            lower[h] = np.maximum(np.expm1(log_lo), 0.0)
+            upper[h] = np.expm1(log_hi)
+
+        return lower, upper
+
+    def update_aci(
+        self,
+        log_preds: np.ndarray,
+        log_stds: np.ndarray,
+        log_actuals: np.ndarray,
+    ) -> None:
+        """
+        ACI adaptive alpha update after observing actuals.
+
+        α_{h,t+1} = α_{h,t} + γ · (err_t - α_base)
+        where err_t = 1 if observation fell outside the interval, 0 otherwise.
+        """
+        n_steps = min(len(log_preds), self.horizon)
+        for h in range(n_steps):
+            res = np.array(self.residuals[h])
+            if len(res) < 10:
+                continue
+
+            a = self.alpha_h[h]
+            q_lo = np.quantile(res, a / 2)
+            q_hi = np.quantile(res, min(1 - a / 2, 1.0))
+
+            p = np.atleast_1d(log_preds[h])
+            s = np.atleast_1d(log_stds[h])
+            act = np.atleast_1d(log_actuals[h])
+            norm = (act - p) / np.maximum(s, 1e-6)
+
+            # Check coverage for each county
+            covered = np.mean((norm >= q_lo) & (norm <= q_hi))
+            err = 1.0 - covered
+
+            # ACI update: if under-covered, alpha decreases → wider intervals
+            self.alpha_h[h] = float(np.clip(
+                a + self.aci_lr * (err - self.base_alpha),
+                0.005,
+                0.20,
+            ))
 
 
 # =========================================================================== #
@@ -754,6 +924,7 @@ class DKLForecaster:
         return_intervals: bool = False,
         alpha: float = 0.05,
         interval_method: str = "posterior",
+        return_log_space: bool = False,
     ) -> pd.DataFrame:
         """
         Autoregressive multi-step forecast.
@@ -774,12 +945,15 @@ class DKLForecaster:
             Significance level for intervals.
         interval_method : str
             "conformal" (uses calibration) or "posterior" (GP variance).
+        return_log_space : bool
+            If True, also include ``log_pred`` and ``log_std`` columns
+            (in log1p space) for use by PerHorizonConformal.
 
         Returns
         -------
         pd.DataFrame
             Long-format with columns: timestamp, location, pred,
-            [lower, upper].
+            [lower, upper], [log_pred, log_std].
         """
         if self.model is None or self.likelihood is None:
             raise ValueError("Model has not been fitted yet.")
@@ -845,6 +1019,9 @@ class DKLForecaster:
                 if return_intervals:
                     row["lower"] = float(lower[c])
                     row["upper"] = float(upper[c])
+                if return_log_space:
+                    row["log_pred"] = float(mean_log[c])
+                    row["log_std"] = float(std_log[c])
                 all_rows.append(row)
 
             # Update history buffers with the predictions (autoregressive)
