@@ -44,6 +44,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from utils.config import load_config
@@ -166,6 +167,8 @@ class CountySARIMAX:
         self.locations_: Optional[list[str]] = None
         self.exog_columns_: Optional[list[str]] = None  # column names learned at fit time
         self.n_exog_features_: int = 0
+        self.exog_scaler_: Optional[StandardScaler] = None  # fitted on training exog
+        self.ds_train_ = None  # reference to training dataset (for weather at predict time)
 
     @property
     def has_exog(self) -> bool:
@@ -252,8 +255,11 @@ class CountySARIMAX:
         Fit one SARIMAX model per county in the xarray Dataset *ds*.
 
         If exogenous features are configured, the weather and temporal
-        regressors are extracted from the dataset and passed to each
-        per-county SARIMAX fit.
+        regressors are extracted, **standardized** (zero-mean, unit-variance),
+        and passed to each per-county SARIMAX fit.  Standardization is critical
+        because raw weather features span wildly different scales (surface
+        pressure ~100,000 Pa vs precipitation ~0.001 mm/h), which causes the
+        MLE optimizer to fail to converge.
 
         Parameters
         ----------
@@ -264,6 +270,10 @@ class CountySARIMAX:
         locations = list(ds.location.values)
         self.locations_ = [str(loc) for loc in locations]
         self.models = {}
+
+        # Keep a reference to the training dataset so that at predict time
+        # we can extract weather data even if ds_future lacks it.
+        self.ds_train_ = ds
 
         # ── Log configuration ──────────────────────────────────────────
         if self.has_exog:
@@ -278,6 +288,23 @@ class CountySARIMAX:
         else:
             print("  [SARIMAX] No exogenous features (pure SARIMA mode)")
 
+        # ── First pass: build exog for the first county to fit the scaler ──
+        if self.has_exog:
+            first_loc = self.locations_[0]
+            first_exog_df = self._build_exog(ds, location=first_loc)
+            if first_exog_df is not None:
+                self.exog_columns_ = list(first_exog_df.columns)
+                self.n_exog_features_ = len(self.exog_columns_)
+                # Fit a global StandardScaler so all features are zero-mean,
+                # unit-variance.  This prevents the MLE optimizer from being
+                # dominated by large-scale features like surface pressure.
+                self.exog_scaler_ = StandardScaler()
+                self.exog_scaler_.fit(first_exog_df.values.astype(float))
+                print(f"  [SARIMAX] Exog columns ({self.n_exog_features_}): {self.exog_columns_}")
+                print(f"  [SARIMAX] Training samples per county: {ds.sizes['timestamp']}")
+                print(f"  [SARIMAX] Exog features standardized (zero-mean, unit-variance)")
+
+        # ── Second pass: fit one SARIMAX per county ────────────────────
         n_success = 0
         n_failed = 0
         first_summary_printed = False
@@ -289,16 +316,12 @@ class CountySARIMAX:
             # Build exogenous DataFrame for this county's training period
             exog_df = self._build_exog(ds, location=loc_str)
 
-            # Convert to numpy for statsmodels, but save column names
+            # Standardize using the global scaler
             exog_array = None
-            if exog_df is not None:
-                # Record column names on first county (same for all counties)
-                if self.exog_columns_ is None:
-                    self.exog_columns_ = list(exog_df.columns)
-                    self.n_exog_features_ = len(self.exog_columns_)
-                    print(f"  [SARIMAX] Exog columns ({self.n_exog_features_}): {self.exog_columns_}")
-                    print(f"  [SARIMAX] Training samples per county: {len(y_train)}")
-                exog_array = exog_df.values.astype(float)
+            if exog_df is not None and self.exog_scaler_ is not None:
+                exog_array = self.exog_scaler_.transform(
+                    exog_df.values.astype(float)
+                )
 
             fitted = _safe_fit_sarimax(
                 y_train,
@@ -332,38 +355,47 @@ class CountySARIMAX:
         if self.exog_columns_ is None:
             return
 
-        params = fitted_result.params
-        pvalues = fitted_result.pvalues
+        try:
+            # Get parameter names — available on the model object as a plain list
+            # regardless of statsmodels version.
+            param_names = fitted_result.model.param_names
+            params = np.asarray(fitted_result.params).flatten()
+            pvalues = np.asarray(fitted_result.pvalues).flatten()
 
-        # statsmodels names exog params as x1, x2, ... — map back to our names.
-        # The first few params are AR/MA coefficients; exog params follow.
-        # We can identify them by the param names containing 'x' or by count.
-        exog_param_names = [k for k in params.index if k.startswith("x")]
+            # Identify which parameters correspond to the exogenous regressors.
+            # statsmodels names them "x1", "x2", ... or uses the DataFrame column
+            # names if a DataFrame was passed as exog.
+            exog_indices = [
+                i for i, name in enumerate(param_names)
+                if name.startswith("x") and name[1:].isdigit()
+            ]
 
-        if not exog_param_names:
-            # Sometimes statsmodels uses different naming — try by position
-            # The ARIMA params are: intercept + AR + MA + seasonal,
-            # and the exog params are the remaining.
-            n_arima_params = 1 + self.order[0] + self.order[2]  # intercept + AR + MA
-            if self.seasonal_order is not None:
-                s = self.seasonal_order
-                n_arima_params += s[0] + s[2]
-            exog_param_names = list(params.index[n_arima_params:n_arima_params + self.n_exog_features_])
+            # Fallback: if no "x1" style names found, slice by position.
+            # ARIMA params come first (intercept + AR + MA + seasonal AR/MA + sigma2),
+            # then the exog params.
+            if len(exog_indices) != self.n_exog_features_:
+                # Count non-exog params: intercept + ar.L1..Lp + ma.L1..Lq + seasonal + sigma2
+                n_non_exog = len(param_names) - self.n_exog_features_
+                exog_indices = list(range(n_non_exog, n_non_exog + self.n_exog_features_))
 
-        if len(exog_param_names) != self.n_exog_features_:
-            print(f"  [SARIMAX] Note: expected {self.n_exog_features_} exog params, "
-                  f"found {len(exog_param_names)} — diagnostics may be misaligned")
-            return
+            if len(exog_indices) != self.n_exog_features_:
+                print(f"  [SARIMAX] Note: could not align {self.n_exog_features_} exog params "
+                      f"with {len(param_names)} total params — skipping diagnostics")
+                return
 
-        print(f"\n  [SARIMAX] Exogenous coefficient diagnostics (county: {county_name}):")
-        print(f"  {'Feature':<20s} {'Coeff':>12s} {'p-value':>10s} {'Significant?':>14s}")
-        print(f"  {'─' * 58}")
-        for col_name, param_name in zip(self.exog_columns_, exog_param_names):
-            coeff = params[param_name]
-            pval = pvalues[param_name]
-            sig = "***" if pval < 0.001 else ("**" if pval < 0.01 else ("*" if pval < 0.05 else ""))
-            print(f"  {col_name:<20s} {coeff:>12.6f} {pval:>10.4f} {sig:>14s}")
-        print()
+            print(f"\n  [SARIMAX] Exogenous coefficient diagnostics (county: {county_name}):")
+            print(f"  {'Feature':<20s} {'Coeff':>12s} {'p-value':>10s} {'Significant?':>14s}")
+            print(f"  {'─' * 58}")
+            for col_name, idx in zip(self.exog_columns_, exog_indices):
+                coeff = float(params[idx])
+                pval = float(pvalues[idx])
+                sig = "***" if pval < 0.001 else ("**" if pval < 0.01 else ("*" if pval < 0.05 else ""))
+                print(f"  {col_name:<20s} {coeff:>12.6f} {pval:>10.4f} {sig:>14s}")
+            print()
+
+        except Exception as e:
+            # Diagnostics are informational — never let them crash the pipeline
+            print(f"  [SARIMAX] Could not print exog diagnostics: {e}")
 
     # ------------------------------------------------------------------ #
     #  Prediction                                                          #
@@ -419,15 +451,22 @@ class CountySARIMAX:
         timestamps = pd.to_datetime(timestamps)
         n_steps = len(timestamps)
 
-        # Validate: if we used weather exog during training, we need future
-        # weather data to forecast.
-        if self.weather_features and ds_future is None:
-            raise ValueError(
-                "This model was trained with exogenous weather features "
-                f"({self.weather_features}), but no ds_future was provided "
-                "for the prediction period.  Pass ds_future= so that future "
-                "weather data can be extracted."
-            )
+        # Determine the best dataset for extracting weather features.
+        # If ds_future has weather data, use it directly.  Otherwise fall
+        # back to the training dataset — build_sarimax_exog will forward-fill
+        # the last known weather values to cover the forecast horizon.
+        # Temporal features are always computed from timestamps directly.
+        weather_source = None
+        if self.weather_features:
+            if ds_future is not None and hasattr(ds_future, "weather") and "feature" in getattr(ds_future, "dims", {}):
+                weather_source = ds_future
+            elif self.ds_train_ is not None:
+                weather_source = self.ds_train_
+                print("  [SARIMAX] Note: ds_future lacks weather data, "
+                      "using training dataset with forward-fill for weather features")
+            else:
+                print("  [SARIMAX] Warning: no weather data available for forecast period, "
+                      "falling back to temporal-only features")
 
         rows: list[pd.DataFrame] = []
         for loc in locations:
@@ -437,29 +476,34 @@ class CountySARIMAX:
             # Build exogenous features for the prediction period
             exog_future = None
             if self.has_exog:
-                if ds_future is not None:
+                # Try weather source first, then temporal-only fallback
+                exog_df = None
+                if weather_source is not None:
                     exog_df = self._build_exog(
-                        ds_future, location=loc_str, timestamps=timestamps,
+                        weather_source, location=loc_str, timestamps=timestamps,
                     )
-                    if exog_df is not None:
-                        # ── Dimension guard ─────────────────────────────
-                        # Verify the feature count matches what was used at
-                        # fit time.  A mismatch here means the exogenous
-                        # configuration changed between training and
-                        # inference, which will cause statsmodels to crash.
-                        if self.n_exog_features_ > 0 and exog_df.shape[1] != self.n_exog_features_:
-                            raise ValueError(
-                                f"Exog dimension mismatch for county {loc_str}: "
-                                f"fit had {self.n_exog_features_} features "
-                                f"({self.exog_columns_}), but predict built "
-                                f"{exog_df.shape[1]} features ({list(exog_df.columns)}). "
-                                f"Ensure the same exogenous config is used for both."
-                            )
-                        exog_future = exog_df.values.astype(float)
-                elif self.include_temporal and not self.weather_features:
-                    # Temporal-only mode: build features from timestamps alone
+                elif self.include_temporal:
+                    # Temporal-only mode: build from timestamps alone
                     from utils.feature_engineering import build_temporal_features
-                    exog_future = build_temporal_features(timestamps).values
+                    exog_df = build_temporal_features(timestamps)
+
+                if exog_df is not None:
+                    # ── Dimension guard ─────────────────────────────
+                    if self.n_exog_features_ > 0 and exog_df.shape[1] != self.n_exog_features_:
+                        raise ValueError(
+                            f"Exog dimension mismatch for county {loc_str}: "
+                            f"fit had {self.n_exog_features_} features "
+                            f"({self.exog_columns_}), but predict built "
+                            f"{exog_df.shape[1]} features ({list(exog_df.columns)}). "
+                            f"Ensure the same exogenous config is used for both."
+                        )
+                    # Apply the same standardization used at fit time
+                    if self.exog_scaler_ is not None:
+                        exog_future = self.exog_scaler_.transform(
+                            exog_df.values.astype(float)
+                        )
+                    else:
+                        exog_future = exog_df.values.astype(float)
 
             if model is None:
                 # Fallback: zero forecast when the model could not be fitted

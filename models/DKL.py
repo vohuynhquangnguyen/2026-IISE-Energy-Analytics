@@ -193,7 +193,7 @@ class DKLForecaster:
         dropout: float = 0.1,
         # --- Training ---
         epochs: int = 40,
-        batch_size: int = 1024,
+        batch_size: int = 64,
         lr: float = 5e-3,
         grad_clip_norm: float = 1.0,
         max_train_rows: Optional[int] = None,
@@ -201,7 +201,7 @@ class DKLForecaster:
         device: Optional[str] = None,
         clip_nonnegative: bool = True,
         num_workers: int = 0,
-        predict_batch_size: int = 4096,
+        predict_batch_size: int = 64,
         lag_noise_frac: float = 0.3,
         lag_noise_scale: float = 0.15,
         early_stopping_patience: int = 10,

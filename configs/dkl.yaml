@@ -74,7 +74,7 @@ features:
 # ---------------------------------------------------------------------------
 model:
   # Sizes of hidden layers in the MLP feature extractor
-  hidden_dims: [512, 256, 128, 64]
+  hidden_dims: [256, 128, 64]
 
   # Dimensionality of the embedding fed into the GP kernel
   embed_dim: 32
@@ -92,8 +92,8 @@ model:
 # Training
 # ---------------------------------------------------------------------------
 training:
-  epochs: 40
-  batch_size: 1024
+  epochs: 100
+  batch_size: 256
   lr: 5.0e-3
 
   # Maximum gradient norm (prevents GP-related gradient explosions)
@@ -110,7 +110,7 @@ training:
 
   # DataLoader settings
   num_workers: 0
-  predict_batch_size: 4096
+  predict_batch_size: 64
 
   # Noise injection on outage-lag columns during training
   # (improves autoregressive robustness at test time)

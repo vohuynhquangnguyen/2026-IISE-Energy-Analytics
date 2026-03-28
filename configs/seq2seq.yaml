@@ -31,7 +31,7 @@ training:
   batch_size: 64
 
   # Total training epochs
-  epochs: 5
+  epochs: 100
 
   # Adam optimiser learning rate
   lr: 1.0e-3

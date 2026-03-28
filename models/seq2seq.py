@@ -125,7 +125,7 @@ class Seq2SeqForecaster:
         hidden_dim: int = 64,
         num_layers: int = 1,
         batch_size: int = 64,
-        epochs: int = 5,
+        epochs: int = 100,
         lr: float = 1e-3,
         grad_clip_norm: float = 5.0,
         clip_nonnegative: bool = True,

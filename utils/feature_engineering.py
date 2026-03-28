@@ -636,7 +636,11 @@ def build_sarimax_exog(
     frames: list[pd.DataFrame] = []
 
     # ── Weather features from the dataset ──────────────────────────────
-    if weather_features:
+    # Guard: the dataset may not contain a 'weather' variable (e.g. the
+    # competition test set only has 'out' and 'tracked').  In that case
+    # we silently skip weather features and fall through to temporal-only.
+    has_weather_var = hasattr(ds, "weather") and "feature" in ds.dims
+    if weather_features and has_weather_var:
         available = [str(f) for f in ds.feature.values]
         valid_features = [f for f in weather_features if f in available]
 
