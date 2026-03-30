@@ -110,7 +110,7 @@ training:
 
   # DataLoader settings
   num_workers: 0
-  predict_batch_size: 64
+  predict_batch_size: 256
 
   # Noise injection on outage-lag columns during training
   # (improves autoregressive robustness at test time)
