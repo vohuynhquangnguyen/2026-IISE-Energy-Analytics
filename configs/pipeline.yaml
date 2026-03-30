@@ -36,6 +36,7 @@ models:
   - sarimax
   - seq2seq
   - dkl
+  - xgboostlss
 
 # --- Prediction intervals ---
 intervals:

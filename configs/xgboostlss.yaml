@@ -1,0 +1,126 @@
+# ============================================================================
+# XGBoostLSS Configuration
+# ============================================================================
+# XGBoostLSS with Zero-Inflated Negative Binomial (ZINB) distribution for
+# power-outage forecasting.  Uses direct multi-horizon training where the
+# forecast horizon is an explicit input feature, allowing a single model to
+# produce forecasts for all 48 lead times.
+#
+# Configuration is loaded by XGBoostLSSForecaster.from_config().
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------------
+features:
+  # Outage lag steps (hours into the past from the forecast origin)
+  lookback_lags: [1, 2, 3, 6, 12, 24]
+
+  # Rolling-window sizes for outage statistics (mean, max, std)
+  rolling_windows: [3, 6, 12, 24]
+
+  # Key weather variables kept as raw features.
+  # These are intersected with the dataset's actual weather features at runtime.
+  key_weather_features:
+    - gust
+    - cape
+    - cape_1
+    - max_10si
+    - mslma
+    - fricv
+    - cnwat
+    - tcc_1
+    - v10
+    - sp
+    - mstav
+    - prate
+    - vis
+    - lcc
+    - hail
+    - ltng
+    - refc
+    - cin
+    - lftx
+    - sh2
+    - d2m
+    - t2m
+    - r2
+    - blh
+    - u10
+    - v
+    - u
+    - tp
+    - sdswrf
+    - pwat
+
+  # Rolling-window sizes for weather aggregations
+  weather_rolling_windows: [6, 24]
+
+  # Number of top weather features to compute trend (diff-3) for
+  weather_trend_top_n: 10
+
+# ---------------------------------------------------------------------------
+# Training data construction
+# ---------------------------------------------------------------------------
+training_data:
+  # Maximum number of training samples (subsamples origins if exceeded)
+  max_samples: 600000
+
+  # Subsampled forecast horizons used during training.
+  # Denser near the origin (short-term), sparser further out.
+  train_horizons: [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 30, 36, 42, 48]
+
+  # Maximum forecast horizon (hours)
+  max_horizon: 48
+
+# ---------------------------------------------------------------------------
+# XGBoostLSS model settings
+# ---------------------------------------------------------------------------
+model:
+  # Distribution family (ZINB = Zero-Inflated Negative Binomial)
+  distribution: ZINB
+
+  # Stabilization method for distribution parameters
+  stabilization: MAD
+
+  # Number of boosting iterations (upper bound; early stopping may reduce)
+  n_iterations: 500
+
+  # Early stopping patience (rounds without improvement)
+  early_stopping_rounds: 30
+
+  # Number of cross-validation folds for Optuna
+  optuna_nfold: 3
+
+  # Maximum minutes for Optuna hyperparameter search
+  optuna_max_minutes: 20
+
+# ---------------------------------------------------------------------------
+# Optuna hyperparameter search space
+# ---------------------------------------------------------------------------
+optuna:
+  n_trials: 30
+
+  param_dict:
+    eta:              ["float", {"low": 0.01, "high": 0.3,  "log": true}]
+    max_depth:        ["int",   {"low": 2,    "high": 6,    "log": false}]
+    min_child_weight: ["float", {"low": 0.1,  "high": 10,   "log": true}]
+    subsample:        ["float", {"low": 0.5,  "high": 1.0,  "log": false}]
+    colsample_bytree: ["float", {"low": 0.3,  "high": 1.0,  "log": false}]
+    gamma:            ["float", {"low": 0.0001, "high": 5.0, "log": true}]
+
+# ---------------------------------------------------------------------------
+# Prediction intervals
+# ---------------------------------------------------------------------------
+intervals:
+  # Number of distribution samples for Monte-Carlo prediction
+  n_samples: 1000
+
+  # Quantile levels for 95% prediction interval
+  lower_quantile: 0.025
+  upper_quantile: 0.975
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+random_seed: 42

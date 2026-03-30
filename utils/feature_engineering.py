@@ -675,3 +675,353 @@ def build_sarimax_exog(
     exog_df = pd.concat(frames, axis=1)
     return exog_df
 
+
+# =========================================================================== #
+#  Section 4 — XGBoostLSS direct multi-horizon features                       #
+# =========================================================================== #
+#
+# The XGBoostLSS model uses *direct multi-horizon* training: the forecast
+# horizon is an explicit input feature, so a single model predicts all 48
+# lead times.  Each training sample is a (origin_time, horizon, county)
+# triple, and features are computed from the origin time only (no future
+# information).
+#
+# Functions:
+#   xgblss_feature_names  — deterministic list of column names
+#   xgblss_origin_feats   — vectorised features for one origin time
+#   xgblss_fill_row       — write one sample into a preallocated array
+#   xgblss_build_train    — build the full training DataFrame
+#   xgblss_build_forecast — build forecast feature DataFrame
+# =========================================================================== #
+
+
+def xgblss_feature_names(
+    available_weather: list[str],
+    lookback_lags: list[int] | None = None,
+    rolling_windows: list[int] | None = None,
+    weather_rolling_windows: list[int] | None = None,
+    weather_trend_top_n: int = 10,
+) -> list[str]:
+    """Return the ordered list of feature column names for XGBoostLSS."""
+    if lookback_lags is None:
+        lookback_lags = [1, 2, 3, 6, 12, 24]
+    if rolling_windows is None:
+        rolling_windows = [3, 6, 12, 24]
+    if weather_rolling_windows is None:
+        weather_rolling_windows = [6, 24]
+
+    cols: list[str] = [
+        "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+        "is_weekend", "hour_raw", "forecast_horizon",
+        "tracked_log", "county_id", "out_current",
+    ]
+    for lag in lookback_lags:
+        cols.append(f"out_lag{lag}")
+    for w in rolling_windows:
+        cols.extend([f"out_rmean{w}", f"out_rmax{w}", f"out_rstd{w}"])
+    for f in available_weather:
+        cols.append(f"wx_{f}")
+    for f in available_weather:
+        for w in weather_rolling_windows:
+            cols.extend([f"wx_{f}_rmean{w}", f"wx_{f}_rmax{w}"])
+    for f in available_weather[:weather_trend_top_n]:
+        cols.append(f"wx_{f}_trend3")
+    return cols
+
+
+def xgblss_origin_feats(
+    out: np.ndarray,
+    trk: np.ndarray,
+    wth: np.ndarray,
+    weather_indices: list[int],
+    available_weather: list[str],
+    t: int,
+    n_locations: int,
+    lookback_lags: list[int],
+    rolling_windows: list[int],
+    weather_rolling_windows: list[int],
+    weather_trend_top_n: int = 10,
+) -> dict[str, np.ndarray]:
+    """
+    Compute vectorised (all-counties) features at a single origin time *t*.
+
+    Parameters
+    ----------
+    out : (T, L) outage array
+    trk : (T, L) tracked array
+    wth : (T, L, F) weather array
+    weather_indices : indices into wth's F dimension for available_weather
+    available_weather : ordered list of weather feature names
+    t : origin time index
+    n_locations : L
+    lookback_lags, rolling_windows, weather_rolling_windows : config lists
+    weather_trend_top_n : how many top weather vars get a trend feature
+    """
+    o: dict[str, np.ndarray] = {}
+    o["out_current"] = out[t, :]
+    o["tracked_log"] = np.log1p(trk[t, :])
+
+    for lag in lookback_lags:
+        tl = t - lag
+        o[f"out_lag{lag}"] = out[tl, :] if tl >= 0 else np.zeros(n_locations)
+
+    for w in rolling_windows:
+        s = max(0, t - w + 1)
+        d = out[s : t + 1, :]
+        o[f"out_rmean{w}"] = d.mean(0)
+        o[f"out_rmax{w}"] = d.max(0)
+        o[f"out_rstd{w}"] = d.std(0)
+
+    for fi, fn in zip(weather_indices, available_weather):
+        o[f"wx_{fn}"] = wth[t, :, fi]
+
+    for fi, fn in zip(weather_indices, available_weather):
+        for w in weather_rolling_windows:
+            s = max(0, t - w + 1)
+            d = wth[s : t + 1, :, fi]
+            o[f"wx_{fn}_rmean{w}"] = d.mean(0)
+            o[f"wx_{fn}_rmax{w}"] = d.max(0)
+
+    top_indices = weather_indices[:weather_trend_top_n]
+    top_names = available_weather[:weather_trend_top_n]
+    for fi, fn in zip(top_indices, top_names):
+        o[f"wx_{fn}_trend3"] = (
+            (wth[t, :, fi] - wth[t - 3, :, fi]) if t >= 3 else np.zeros(n_locations)
+        )
+
+    return o
+
+
+def _xgblss_fill_row(
+    X: np.ndarray,
+    idx: int,
+    origin_feats: dict[str, np.ndarray],
+    temporal: np.ndarray,
+    loc_idx: int,
+    available_weather: list[str],
+    lookback_lags: list[int],
+    rolling_windows: list[int],
+    weather_rolling_windows: list[int],
+    weather_trend_top_n: int = 10,
+) -> None:
+    """Write a single sample row into the preallocated feature matrix *X*."""
+    # temporal: [hour_sin, hour_cos, dow_sin, dow_cos, is_weekend, hour_raw, horizon]
+    X[idx, :7] = temporal
+    X[idx, 7] = origin_feats["tracked_log"][loc_idx]
+    X[idx, 8] = float(loc_idx)
+    X[idx, 9] = origin_feats["out_current"][loc_idx]
+
+    c = 10
+    for lag in lookback_lags:
+        X[idx, c] = origin_feats[f"out_lag{lag}"][loc_idx]
+        c += 1
+    for w in rolling_windows:
+        X[idx, c] = origin_feats[f"out_rmean{w}"][loc_idx]
+        c += 1
+        X[idx, c] = origin_feats[f"out_rmax{w}"][loc_idx]
+        c += 1
+        X[idx, c] = origin_feats[f"out_rstd{w}"][loc_idx]
+        c += 1
+    for fn in available_weather:
+        X[idx, c] = origin_feats[f"wx_{fn}"][loc_idx]
+        c += 1
+    for fn in available_weather:
+        for _w in weather_rolling_windows:
+            X[idx, c] = origin_feats[f"wx_{fn}_rmean{_w}"][loc_idx]
+            c += 1
+            X[idx, c] = origin_feats[f"wx_{fn}_rmax{_w}"][loc_idx]
+            c += 1
+    for fn in available_weather[:weather_trend_top_n]:
+        X[idx, c] = origin_feats[f"wx_{fn}_trend3"][loc_idx]
+        c += 1
+
+
+def xgblss_build_train(
+    ds,
+    available_weather: list[str],
+    all_weather_features: list[str],
+    *,
+    lookback_lags: list[int] | None = None,
+    rolling_windows: list[int] | None = None,
+    weather_rolling_windows: list[int] | None = None,
+    weather_trend_top_n: int = 10,
+    train_horizons: list[int] | None = None,
+    max_samples: int = 600_000,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Build direct multi-horizon training data for XGBoostLSS.
+
+    Each sample is a (origin, horizon, county) triple.  All valid origins are
+    used; if the estimated sample count exceeds *max_samples* a random subset
+    of origins is drawn.
+
+    Returns a DataFrame with feature columns + ``target``.
+    """
+    if lookback_lags is None:
+        lookback_lags = [1, 2, 3, 6, 12, 24]
+    if rolling_windows is None:
+        rolling_windows = [3, 6, 12, 24]
+    if weather_rolling_windows is None:
+        weather_rolling_windows = [6, 24]
+    if train_horizons is None:
+        train_horizons = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 30, 36, 42, 48]
+
+    ts = pd.to_datetime(ds.timestamp.values)
+    out = ds.out.transpose("timestamp", "location").values.astype(np.float64)
+    trk = ds.tracked.transpose("timestamp", "location").values.astype(np.float64)
+    wth = ds.weather.transpose("timestamp", "location", "feature").values.astype(np.float64)
+    T, L, F = wth.shape
+
+    fi_map = {f: i for i, f in enumerate(all_weather_features)}
+    weather_indices = [fi_map[f] for f in available_weather]
+
+    col_names = xgblss_feature_names(
+        available_weather, lookback_lags, rolling_windows,
+        weather_rolling_windows, weather_trend_top_n,
+    )
+    n_features = len(col_names)
+
+    min_history = max(lookback_lags + rolling_windows)
+    valid_origins = list(range(min_history, T - 1))
+    usable_horizons = [h for h in train_horizons if h <= T - min_history - 1]
+    est = len(valid_origins) * len(usable_horizons) * L
+
+    print(f"  Origins: {len(valid_origins)}, horizons: {usable_horizons}, est: {est:,}")
+
+    rng = np.random.RandomState(random_seed)
+    if est > max_samples:
+        n_origins = max(50, max_samples // (len(usable_horizons) * L))
+        origin_indices = sorted(
+            rng.choice(valid_origins, min(n_origins, len(valid_origins)), replace=False)
+        )
+        print(f"  Subsampled to {len(origin_indices)} origins "
+              f"-> ~{len(origin_indices) * len(usable_horizons) * L:,}")
+    else:
+        origin_indices = valid_origins
+
+    X = np.empty((len(origin_indices) * len(usable_horizons) * L, n_features),
+                 dtype=np.float32)
+    Y = np.empty(len(origin_indices) * len(usable_horizons) * L, dtype=np.float32)
+    idx = 0
+
+    for t in origin_indices:
+        o = xgblss_origin_feats(
+            out, trk, wth, weather_indices, available_weather, t, L,
+            lookback_lags, rolling_windows, weather_rolling_windows,
+            weather_trend_top_n,
+        )
+        for h in usable_horizons:
+            tt = t + h
+            if tt >= T:
+                continue
+            s = ts[tt]
+            th_ = s.hour
+            td_ = s.dayofweek
+            temporal = np.array([
+                np.sin(2 * np.pi * th_ / 24),
+                np.cos(2 * np.pi * th_ / 24),
+                np.sin(2 * np.pi * td_ / 7),
+                np.cos(2 * np.pi * td_ / 7),
+                1.0 if td_ >= 5 else 0.0,
+                float(th_),
+                float(h),
+            ], dtype=np.float32)
+            for li in range(L):
+                _xgblss_fill_row(
+                    X, idx, o, temporal, li, available_weather,
+                    lookback_lags, rolling_windows, weather_rolling_windows,
+                    weather_trend_top_n,
+                )
+                Y[idx] = out[tt, li]
+                idx += 1
+
+    X = X[:idx]
+    Y = Y[:idx]
+    df = pd.DataFrame(X, columns=col_names)
+    df["target"] = Y
+    print(f"  Final: {len(df):,} samples, {n_features} features")
+    print(f"  Target: mean={Y.mean():.2f}, zero%={(Y == 0).mean() * 100:.1f}%, "
+          f"max={Y.max():.0f}")
+    return df
+
+
+def xgblss_build_forecast(
+    ds,
+    forecast_timestamps: pd.DatetimeIndex,
+    available_weather: list[str],
+    all_weather_features: list[str],
+    *,
+    lookback_lags: list[int] | None = None,
+    rolling_windows: list[int] | None = None,
+    weather_rolling_windows: list[int] | None = None,
+    weather_trend_top_n: int = 10,
+) -> pd.DataFrame:
+    """
+    Build forecast features from the end of the training data.
+
+    Returns a DataFrame with feature columns + ``timestamp`` + ``location``.
+    """
+    if lookback_lags is None:
+        lookback_lags = [1, 2, 3, 6, 12, 24]
+    if rolling_windows is None:
+        rolling_windows = [3, 6, 12, 24]
+    if weather_rolling_windows is None:
+        weather_rolling_windows = [6, 24]
+
+    locations = [str(loc) for loc in ds.location.values]
+    out = ds.out.transpose("timestamp", "location").values.astype(np.float64)
+    trk = ds.tracked.transpose("timestamp", "location").values.astype(np.float64)
+    wth = ds.weather.transpose("timestamp", "location", "feature").values.astype(np.float64)
+    T, L, F = wth.shape
+
+    fi_map = {f: i for i, f in enumerate(all_weather_features)}
+    weather_indices = [fi_map[f] for f in available_weather]
+
+    col_names = xgblss_feature_names(
+        available_weather, lookback_lags, rolling_windows,
+        weather_rolling_windows, weather_trend_top_n,
+    )
+    n_features = len(col_names)
+
+    t = T - 1
+    o = xgblss_origin_feats(
+        out, trk, wth, weather_indices, available_weather, t, L,
+        lookback_lags, rolling_windows, weather_rolling_windows,
+        weather_trend_top_n,
+    )
+
+    n_rows = len(forecast_timestamps) * L
+    X = np.empty((n_rows, n_features), dtype=np.float32)
+    ts_out: list = []
+    loc_out: list = []
+    idx = 0
+
+    for hi, ft in enumerate(forecast_timestamps):
+        h = hi + 1
+        th_ = ft.hour
+        td_ = ft.dayofweek
+        temporal = np.array([
+            np.sin(2 * np.pi * th_ / 24),
+            np.cos(2 * np.pi * th_ / 24),
+            np.sin(2 * np.pi * td_ / 7),
+            np.cos(2 * np.pi * td_ / 7),
+            1.0 if td_ >= 5 else 0.0,
+            float(th_),
+            float(h),
+        ], dtype=np.float32)
+        for li in range(L):
+            _xgblss_fill_row(
+                X, idx, o, temporal, li, available_weather,
+                lookback_lags, rolling_windows, weather_rolling_windows,
+                weather_trend_top_n,
+            )
+            ts_out.append(ft)
+            loc_out.append(locations[li])
+            idx += 1
+
+    df = pd.DataFrame(X[:idx], columns=col_names)
+    df["timestamp"] = ts_out
+    df["location"] = loc_out
+    return df
+
