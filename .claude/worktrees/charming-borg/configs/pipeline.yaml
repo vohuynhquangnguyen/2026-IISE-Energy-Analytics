@@ -1,0 +1,42 @@
+# ============================================================================
+# Pipeline Configuration
+# ============================================================================
+# Top-level settings that govern the overall training / validation / testing
+# workflow in main.py.  Model-specific hyperparameters live in their own
+# YAML files under ./configs/.
+# ============================================================================
+
+# --- Data paths ---
+data:
+  data_dir: data
+  train_file: train.nc
+  test_48h_file: test_48h_demo.nc
+
+# --- Results ---
+results_dir: results
+
+# --- Walk-forward validation ---
+# Walk-forward validation mimics k-fold CV for time-series data:
+# each fold uses an expanding training window and a fixed-size
+# validation horizon, ensuring no future leakage.
+walk_forward:
+  # Number of temporal folds (analogous to k in k-fold CV)
+  n_folds: 3
+
+  # Validation horizon per fold (hours) — matches the competition's 48h window
+  horizon: 48
+
+  # Minimum fraction of the dataset used for training in the first fold
+  # (prevents degenerate folds with too little history)
+  min_train_frac: 0.5
+
+# --- Model selection ---
+# Which models to run during the pipeline.  Comment out any model to skip it.
+models:
+  - sarimax
+  - seq2seq
+  - dkl
+
+# --- Prediction intervals ---
+intervals:
+  alpha: 0.05

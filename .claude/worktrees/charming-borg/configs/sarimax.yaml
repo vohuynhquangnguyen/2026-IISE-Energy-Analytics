@@ -1,0 +1,79 @@
+# ============================================================================
+# SARIMAX Configuration
+# ============================================================================
+# This file controls the hyperparameters for the SARIMAX model.
+#
+# SARIMAX = Seasonal AutoRegressive Integrated Moving Average with eXogenous
+#           regressors.  Unlike a plain ARIMA, it can condition forecasts on
+#           external variables (weather, temporal encodings) that are known
+#           for both the historical AND future periods.
+#
+# Reference: demo.ipynb — Cell 21 (safe_fit_sarimax baseline)
+# ============================================================================
+
+model:
+  # ARIMA order (p, d, q):
+  #   p = autoregressive order — how many past outage values influence the forecast
+  #   d = differencing order  — 0 means we model levels, not differences
+  #   q = moving-average order — how many past forecast errors influence the forecast
+  order: [1, 0, 1]
+
+  # Seasonal ARIMA order (P, D, Q, s):
+  #   Set to null to disable seasonality (default in demo.ipynb).
+  #   Example: [1, 0, 1, 24]  for 24-hour (daily) seasonality
+  #   Example: [1, 1, 1, 168] for 168-hour (weekly) seasonality
+  seasonal_order: null
+
+  # Whether to clip predictions to be non-negative (outages cannot be < 0)
+  clip_nonnegative: true
+
+# ---------------------------------------------------------------------------
+# Exogenous regressors (the "X" in SARIMAX)
+# ---------------------------------------------------------------------------
+# These features are available for BOTH the training period and the future
+# forecast horizon (weather comes from the dataset; temporal features are
+# deterministic).  Setting all sub-sections to empty/false reduces SARIMAX
+# to a plain SARIMA with no exogenous inputs.
+#
+# IMPORTANT: the same feature set is used at fit() and predict() time.
+#            Changing this section between training and inference will
+#            cause a dimension mismatch.
+# ---------------------------------------------------------------------------
+exogenous:
+  # Weather variables to include as regressors.
+  # These are extracted directly from the dataset's 'weather' variable.
+  # Set to null or [] to disable weather regressors.
+  #
+  # Recommended subsets (uncomment one):
+  #   Minimal (storm + temperature):
+  #     weather_features: [gust, t2m, prate]
+  #   Moderate (adds pressure, precipitation, wind components):
+  #     weather_features: [gust, t2m, prate, tp, sp, u10, v10, cape]
+  #   Full key subset (same 20 features used by DKL):
+  #     weather_features: [gust, cape, cape_1, tp, prate, refc, hail,
+  #                        u10, v10, t2m, mstav, pwat, sh2, lftx,
+  #                        blh, sdlwrf, sp, tcc, r2, pcdb]
+  weather_features:
+    - gust
+    - t2m
+    - prate
+    - tp
+    - sp
+    - u10
+    - v10
+    - cape
+
+  # Whether to include deterministic temporal features:
+  #   hour_sin, hour_cos, dow_sin, dow_cos, month_sin, month_cos,
+  #   is_weekend, is_night
+  # These help the model learn diurnal and weekly outage patterns.
+  include_temporal: true
+
+  # Whether to derive wind speed (sqrt(u10² + v10²)) and include it.
+  # Only effective if u10 and v10 are in weather_features above.
+  include_wind_speed: true
+
+# --- Prediction interval settings ---
+intervals:
+  # Significance level for confidence intervals (0.05 → 95% PI)
+  alpha: 0.05
