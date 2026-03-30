@@ -47,6 +47,7 @@ from evaluation.metrics import (
 from models.sarimax import CountySARIMAX
 from models.seq2seq import Seq2SeqForecaster
 from models.dkl import DKLForecaster
+from models.xgboostlss import XGBoostLSSForecaster
 
 
 # =========================================================================== #
@@ -318,6 +319,24 @@ def validate_dkl_fold(
     return pred_df, scores
 
 
+def validate_xgboostlss_fold(
+    fold: WalkForwardFold,
+    locations: list[str],
+    model_cfg_path: str = "xgboostlss.yaml",
+) -> tuple[pd.DataFrame, CompetitionScores]:
+    """Train XGBoostLSS on one fold and return predictions + scores."""
+    model = XGBoostLSSForecaster.from_config(model_cfg_path)
+    model.fit(fold.ds_train_sub)
+
+    pred_df = model.predict(
+        fold.ds_train_sub, fold.val_timestamps, return_intervals=True,
+    )
+
+    demo_rmse_val, scores = compute_competition_scores(fold, pred_df, locations)
+    print_scores("XGBoostLSS", demo_rmse_val, scores)
+    return pred_df, scores
+
+
 # =========================================================================== #
 #  Walk-forward validation driver                                              #
 # =========================================================================== #
@@ -366,6 +385,11 @@ def run_walk_forward_validation(
             print("\n  Training DKL...")
             _, scores = validate_dkl_fold(fold, locations, alpha=alpha)
             all_scores["dkl"].append(scores)
+
+        if "xgboostlss" in enabled_models:
+            print("\n  Training XGBoostLSS...")
+            _, scores = validate_xgboostlss_fold(fold, locations)
+            all_scores["xgboostlss"].append(scores)
 
     return all_scores
 
@@ -512,6 +536,28 @@ def retrain_and_predict_dkl(
     print(f"[DKL] Saved → {out_path}")
 
 
+def retrain_and_predict_xgboostlss(
+    bundle: CompetitionData,
+    results_dir: Path,
+) -> None:
+    """Retrain XGBoostLSS on the full training set and save test predictions."""
+    if bundle.ds_test_48h is None:
+        print("[XGBoostLSS] No test set found — skipping.")
+        return
+
+    print("[XGBoostLSS] Retraining on full training data...")
+    model = XGBoostLSSForecaster.from_config("xgboostlss.yaml")
+    model.fit(bundle.ds_train)
+
+    pred_df = model.predict(
+        bundle.ds_train, bundle.test_48h_timestamps, return_intervals=True,
+    )
+
+    out_path = results_dir / "xgboostlss_pred_48h.csv"
+    pred_df.to_csv(out_path, index=False)
+    print(f"[XGBoostLSS] Saved → {out_path}")
+
+
 # =========================================================================== #
 #  Main entry point                                                            #
 # =========================================================================== #
@@ -530,7 +576,7 @@ def main() -> None:
     pipeline_cfg = load_config("pipeline.yaml")
     data_cfg = pipeline_cfg.get("data", {})
     wf_cfg = pipeline_cfg.get("walk_forward", {})
-    enabled_models = pipeline_cfg.get("models", ["sarimax", "seq2seq", "dkl"])
+    enabled_models = pipeline_cfg.get("models", ["sarimax", "seq2seq", "dkl", "xgboostlss"])
     alpha = pipeline_cfg.get("intervals", {}).get("alpha", 0.05)
 
     results_dir = Path(pipeline_cfg.get("results_dir", "results"))
@@ -591,6 +637,9 @@ def main() -> None:
 
     if "dkl" in enabled_models:
         retrain_and_predict_dkl(bundle, results_dir)
+
+    if "xgboostlss" in enabled_models:
+        retrain_and_predict_xgboostlss(bundle, results_dir)
 
     print("\n" + "=" * 70)
     print("  Pipeline complete.  Results saved to:", results_dir)

@@ -106,22 +106,15 @@ def load_competition_data(
     """
     data_dir = Path(data_dir)
 
-    ds_train = xr.open_dataset(data_dir / train_file, engine="netcdf4")
+    ds_train = xr.open_dataset(data_dir / train_file)
 
-    # The test file is optional — it may not be present during local dev,
-    # or may be a placeholder / corrupted file.
+    # The test file is optional — it may not be present during local dev.
     ds_test_48h: Optional[xr.Dataset] = None
     test_48h_timestamps: Optional[pd.DatetimeIndex] = None
     test_path = data_dir / test_48h_file
     if test_path.exists():
-        try:
-            ds_test_48h = xr.open_dataset(test_path, engine="netcdf4")
-        except (OSError, ValueError) as exc:
-            print(f"[WARNING] Could not open test file {test_path}: {exc}")
-            print("          Continuing without test data.")
-            ds_test_48h = None
-        if ds_test_48h is not None:
-            test_48h_timestamps = pd.to_datetime(ds_test_48h.timestamp.values)
+        ds_test_48h = xr.open_dataset(test_path)
+        test_48h_timestamps = pd.to_datetime(ds_test_48h.timestamp.values)
 
     return CompetitionData(
         ds_train=ds_train,

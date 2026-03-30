@@ -77,7 +77,7 @@ model:
   hidden_dims: [256, 128, 64]
 
   # Dimensionality of the embedding fed into the GP kernel
-  embed_dim: 20
+  embed_dim: 32
 
   # Number of inducing points for the sparse variational GP
   num_inducing: 768
@@ -93,7 +93,7 @@ model:
 # ---------------------------------------------------------------------------
 training:
   epochs: 100
-  batch_size: 64
+  batch_size: 256
   lr: 5.0e-3
 
   # Maximum gradient norm (prevents GP-related gradient explosions)
@@ -110,11 +110,11 @@ training:
 
   # DataLoader settings
   num_workers: 0
-  predict_batch_size: 64
+  predict_batch_size: 256
 
   # Noise injection on outage-lag columns during training
   # (improves autoregressive robustness at test time)
-  lag_noise_frac: 0.15
+  lag_noise_frac: 0.3
   lag_noise_scale: 0.15
 
   # Early stopping patience (epochs without validation improvement)
@@ -129,7 +129,7 @@ intervals:
   method: conformal
 
   # Significance level (0.05 → 95% PI)
-  alpha: 0.04
+  alpha: 0.05
 
   # Number of trailing timestamps used for conformal calibration
   calibration_size: 48

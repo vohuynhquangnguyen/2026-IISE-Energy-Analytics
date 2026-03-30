@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xxd -l 16 C:/Users/quang/OneDrive/Documents/GitHub/2026-IISE-Energy-Analytics/data/test_48h_demo.nc)",
+      "Bash(rm data/test_48h_demo.nc)",
+      "Bash(mv data/test_48h_demo_good.nc data/test_48h_demo.nc)"
+    ]
+  }
+}
