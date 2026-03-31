@@ -28,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+import matplotlib.pyplot as plt
 
 from utils.config import load_config
 from utils.data_loader import (
@@ -310,6 +312,223 @@ def retrain_and_predict_dkl(
 
 
 # =========================================================================== #
+#  Feature importance analysis (SHAP + Gradient Attribution)                   #
+# =========================================================================== #
+
+def compute_gradient_attribution(
+    model: DKLForecaster,
+    X: np.ndarray,
+    feature_names: list[str],
+) -> pd.DataFrame:
+    """
+    Compute gradient-based feature attribution for the DKL model.
+
+    For each sample, computes |d(mean_prediction) / d(input_feature)|
+    averaged over all samples to get per-feature importance.
+
+    Returns a DataFrame with columns: feature, importance.
+    """
+    X_clean = np.nan_to_num(
+        np.asarray(X, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0,
+    )
+    X_scaled = model.x_scaler.transform(X_clean).astype(np.float32)
+
+    X_tensor = torch.tensor(X_scaled, dtype=torch.float32, requires_grad=True).to(
+        model.device
+    )
+
+    model.model.eval()
+    model.likelihood.eval()
+
+    import gpytorch as gpy
+
+    with gpy.settings.fast_pred_var():
+        pred_dist = model.likelihood(model.model(X_tensor))
+        pred_mean = pred_dist.mean
+
+    pred_mean.sum().backward()
+    grads = X_tensor.grad.detach().cpu().numpy()  # (N, D)
+
+    # Mean absolute gradient per feature
+    importance = np.abs(grads).mean(axis=0)
+
+    df = pd.DataFrame({"feature": feature_names, "importance": importance})
+    df = df.sort_values("importance", ascending=False).reset_index(drop=True)
+    return df
+
+
+def compute_shap_values(
+    model: DKLForecaster,
+    X: np.ndarray,
+    feature_names: list[str],
+    n_background: int = 150,
+    n_explain: int = 200,
+) -> tuple:
+    """
+    Compute SHAP values for the DKL model using KernelSHAP.
+
+    Parameters
+    ----------
+    model : DKLForecaster
+        Fitted DKL model.
+    X : np.ndarray
+        Full oracle feature matrix.
+    feature_names : list[str]
+        Feature column names.
+    n_background : int
+        Number of background samples for KernelSHAP.
+    n_explain : int
+        Number of samples to explain.
+
+    Returns
+    -------
+    (shap_values, X_explain) : tuple
+        shap_values is the array from the explainer;
+        X_explain is the subset that was explained.
+    """
+    import shap
+
+    rng = np.random.default_rng(42)
+
+    # Subsample background and explanation sets
+    bg_idx = rng.choice(len(X), size=min(n_background, len(X)), replace=False)
+    X_background = X[bg_idx]
+
+    remaining = np.setdiff1d(np.arange(len(X)), bg_idx)
+    ex_idx = rng.choice(remaining, size=min(n_explain, len(remaining)), replace=False)
+    X_explain = X[ex_idx]
+
+    def predict_fn(X_input):
+        result = model.predict_oracle(X_input)
+        return result["mean"]
+
+    background_summary = shap.kmeans(X_background, min(50, len(X_background)))
+    explainer = shap.KernelExplainer(predict_fn, background_summary)
+    shap_values = explainer.shap_values(X_explain)
+
+    return shap_values, X_explain
+
+
+def plot_gradient_attribution(
+    grad_df: pd.DataFrame,
+    results_dir: Path,
+    top_n: int = 25,
+) -> None:
+    """Plot and save a horizontal bar chart of gradient-based feature importance."""
+    top = grad_df.head(top_n)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.barh(range(len(top)), top["importance"].values[::-1])
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(top["feature"].values[::-1], fontsize=9)
+    ax.set_xlabel("Mean |Gradient|")
+    ax.set_title(f"DKL Gradient Attribution (top {top_n} features)")
+    plt.tight_layout()
+
+    path = results_dir / "dkl_gradient_attribution.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved gradient attribution plot → {path}")
+
+
+def plot_shap_summary(
+    shap_values: np.ndarray,
+    X_explain: np.ndarray,
+    feature_names: list[str],
+    results_dir: Path,
+    top_n: int = 25,
+) -> None:
+    """Plot and save a SHAP beeswarm summary plot."""
+    import shap
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    shap.summary_plot(
+        shap_values,
+        X_explain,
+        feature_names=feature_names,
+        max_display=top_n,
+        show=False,
+    )
+    plt.tight_layout()
+
+    path = results_dir / "dkl_shap_summary.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close("all")
+    print(f"  Saved SHAP summary plot → {path}")
+
+    # Also save a bar plot of mean |SHAP|
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    shap_df = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs_shap})
+    shap_df = shap_df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    top = shap_df.head(top_n)
+    ax2.barh(range(len(top)), top["mean_abs_shap"].values[::-1])
+    ax2.set_yticks(range(len(top)))
+    ax2.set_yticklabels(top["feature"].values[::-1], fontsize=9)
+    ax2.set_xlabel("Mean |SHAP value|")
+    ax2.set_title(f"DKL SHAP Feature Importance (top {top_n} features)")
+    plt.tight_layout()
+
+    path2 = results_dir / "dkl_shap_bar.png"
+    fig2.savefig(path2, dpi=150)
+    plt.close(fig2)
+    print(f"  Saved SHAP bar plot → {path2}")
+
+
+def run_feature_importance(
+    bundle: CompetitionData,
+    results_dir: Path,
+) -> None:
+    """
+    Train DKL on the full training set, then compute and plot
+    gradient attribution and SHAP feature importance.
+    """
+    print("\n" + "=" * 70)
+    print("  Feature Importance Analysis (DKL)")
+    print("=" * 70)
+
+    # --- Train model ---
+    print("\n  [1/4] Training DKL on full training data...")
+    model = DKLForecaster.from_config("dkl.yaml")
+    model.fit(bundle.ds_train)
+
+    # --- Build oracle feature table ---
+    print("  [2/4] Building oracle feature table...")
+    X_df, y, _, _ = model.build_feature_table(bundle.ds_train)
+    feature_names = X_df.columns.tolist()
+    X = X_df.to_numpy(dtype=np.float32)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    print(f"         Feature matrix: {X.shape[0]} samples × {X.shape[1]} features")
+
+    # --- Gradient attribution ---
+    print("  [3/4] Computing gradient attribution...")
+    grad_df = compute_gradient_attribution(model, X, feature_names)
+    grad_df.to_csv(results_dir / "dkl_gradient_attribution.csv", index=False)
+    plot_gradient_attribution(grad_df, results_dir)
+    print("\n  Top 10 features by gradient attribution:")
+    for i, row in grad_df.head(10).iterrows():
+        print(f"    {i + 1:2d}. {row['feature']:40s} {row['importance']:.6f}")
+
+    # --- SHAP ---
+    print("\n  [4/4] Computing SHAP values (this may take a few minutes)...")
+    shap_values, X_explain = compute_shap_values(model, X, feature_names)
+    plot_shap_summary(shap_values, X_explain, feature_names, results_dir)
+
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    shap_df = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs_shap})
+    shap_df = shap_df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    shap_df.to_csv(results_dir / "dkl_shap_importance.csv", index=False)
+
+    print("\n  Top 10 features by SHAP:")
+    for i, row in shap_df.head(10).iterrows():
+        print(f"    {i + 1:2d}. {row['feature']:40s} {row['mean_abs_shap']:.6f}")
+
+    print(f"\n  All results saved to {results_dir}/")
+
+
+# =========================================================================== #
 #  Main entry point                                                            #
 # =========================================================================== #
 
@@ -379,6 +598,11 @@ def main() -> None:
     print()
 
     retrain_and_predict_dkl(bundle, results_dir)
+
+    # ================================================================== #
+    #  Phase 4: Feature Importance Analysis                               #
+    # ================================================================== #
+    run_feature_importance(bundle, results_dir)
 
     print("\n" + "=" * 70)
     print("  Pipeline complete.  Results saved to:", results_dir)
