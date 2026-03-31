@@ -11,3 +11,5 @@ torch>=2.2
 tqdm>=4.66
 pyyaml>=6.0
 gpytorch>=1.11
+xgboost>=1.7
+optuna>=0.3
