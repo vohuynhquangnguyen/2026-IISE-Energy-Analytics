@@ -83,7 +83,7 @@ model:
   num_inducing: 768
 
   # Dropout probability in the feature extractor
-  dropout: 0.1
+  dropout: 0.15
 
   # Whether to clip predictions to be non-negative
   clip_nonnegative: true
@@ -114,7 +114,7 @@ training:
 
   # Noise injection on outage-lag columns during training
   # (improves autoregressive robustness at test time)
-  lag_noise_frac: 0.3
+  lag_noise_frac: 0.15
   lag_noise_scale: 0.15
 
   # Early stopping patience (epochs without validation improvement)

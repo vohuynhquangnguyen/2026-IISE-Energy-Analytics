@@ -349,26 +349,26 @@ def main() -> None:
     # ================================================================== #
     #  Phase 2: Walk-Forward Cross-Validation                             #
     # ================================================================== #
-    print("=" * 70)
-    print("  Phase 2: Walk-Forward Cross-Validation")
-    print("=" * 70)
+    # print("=" * 70)
+    # print("  Phase 2: Walk-Forward Cross-Validation")
+    # print("=" * 70)
 
-    folds = walk_forward_split(
-        bundle.ds_train,
-        n_folds=wf_cfg.get("n_folds", 3),
-        horizon=wf_cfg.get("horizon", 48),
-        min_train_frac=wf_cfg.get("min_train_frac", 0.5),
-    )
-    print(f"\n  Created {len(folds)} walk-forward folds "
-          f"(horizon={wf_cfg.get('horizon', 48)} hours)")
+    # folds = walk_forward_split(
+    #     bundle.ds_train,
+    #     n_folds=wf_cfg.get("n_folds", 3),
+    #     horizon=wf_cfg.get("horizon", 48),
+    #     min_train_frac=wf_cfg.get("min_train_frac", 0.5),
+    # )
+    # print(f"\n  Created {len(folds)} walk-forward folds "
+    #       f"(horizon={wf_cfg.get('horizon', 48)} hours)")
 
-    all_scores = run_walk_forward_validation(
-        folds=folds,
-        locations=bundle.locations,
-        alpha=alpha,
-    )
+    # all_scores = run_walk_forward_validation(
+    #     folds=folds,
+    #     locations=bundle.locations,
+    #     alpha=alpha,
+    # )
 
-    print_cv_summary(all_scores)
+    # print_cv_summary(all_scores)
 
     # ================================================================== #
     #  Phase 3: Test Inference                                             #
