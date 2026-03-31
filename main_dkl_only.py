@@ -315,6 +315,74 @@ def retrain_and_predict_dkl(
 #  Feature importance analysis (SHAP + Gradient Attribution)                   #
 # =========================================================================== #
 
+import re
+
+
+def _unify_feature_name(name: str) -> str:
+    """
+    Rename a DKL-convention feature name to the XGBoostLSS report convention.
+
+    Mapping rules:
+        w_{var}                  → wx_{var}
+        w_{var}_roll_mean_{w}    → wx_{var}_rmean{w}
+        w_{var}_roll_max_{w}     → wx_{var}_rmax{w}
+        w_{var}_roll_std_{w}     → wx_{var}_rstd{w}
+        w_{var}_diff_{d}         → wx_{var}_trend{d}
+        w_{var}_lag_{l}          → wx_{var}_lag{l}
+        out_roll_mean_{w}        → out_rmean{w}
+        out_roll_max_{w}         → out_rmax{w}
+        out_roll_std_{w}         → out_rstd{w}
+        out_lag_{l}              → out_lag{l}
+        outage_rate_lag_{l}      → outage_rate_lag{l}
+        log_tracked              → tracked_log
+    """
+    # --- outage rolling stats ---
+    m = re.match(r"^out_roll_(mean|max|std)_(\d+)$", name)
+    if m:
+        return f"out_r{m.group(1)}{m.group(2)}"
+
+    # --- outage lags ---
+    m = re.match(r"^out_lag_(\d+)$", name)
+    if m:
+        return f"out_lag{m.group(1)}"
+
+    # --- outage rate lags ---
+    m = re.match(r"^outage_rate_lag_(\d+)$", name)
+    if m:
+        return f"outage_rate_lag{m.group(1)}"
+
+    # --- log_tracked → tracked_log ---
+    if name == "log_tracked":
+        return "tracked_log"
+
+    # --- weather rolling stats: w_{var}_roll_{stat}_{w} ---
+    m = re.match(r"^w_(.+)_roll_(mean|max|std)_(\d+)$", name)
+    if m:
+        return f"wx_{m.group(1)}_r{m.group(2)}{m.group(3)}"
+
+    # --- weather diffs: w_{var}_diff_{d} → wx_{var}_trend{d} ---
+    m = re.match(r"^w_(.+)_diff_(\d+)$", name)
+    if m:
+        return f"wx_{m.group(1)}_trend{m.group(2)}"
+
+    # --- weather lags: w_{var}_lag_{l} ---
+    m = re.match(r"^w_(.+)_lag_(\d+)$", name)
+    if m:
+        return f"wx_{m.group(1)}_lag{m.group(2)}"
+
+    # --- bare weather: w_{var} → wx_{var} ---
+    m = re.match(r"^w_(.+)$", name)
+    if m:
+        return f"wx_{m.group(1)}"
+
+    return name
+
+
+def unify_feature_names(names: list[str]) -> list[str]:
+    """Apply the unified naming convention to a list of feature names."""
+    return [_unify_feature_name(n) for n in names]
+
+
 def compute_gradient_attribution(
     model: DKLForecaster,
     X: np.ndarray,
@@ -352,8 +420,12 @@ def compute_gradient_attribution(
             pred_dist = model.likelihood(model.model(xb))
             pred_mean = pred_dist.mean
 
-        pred_mean.sum().backward()
-        all_grads.append(xb.grad.detach().cpu().numpy())
+        # Use autograd.grad instead of .backward() to avoid freeing the
+        # shared variational GP computation graph between batches.
+        (grad,) = torch.autograd.grad(
+            pred_mean.sum(), xb, retain_graph=False,
+        )
+        all_grads.append(grad.detach().cpu().numpy())
 
     grads = np.concatenate(all_grads, axis=0)  # (N, D)
 
@@ -420,23 +492,27 @@ def compute_shap_values(
 def plot_gradient_attribution(
     grad_df: pd.DataFrame,
     results_dir: Path,
-    top_n: int = 25,
+    top_n: int = 20,
 ) -> None:
     """Plot and save a horizontal bar chart of gradient-based feature importance."""
-    top = grad_df.head(top_n)
+    # Apply unified naming for display
+    plot_df = grad_df.copy()
+    plot_df["feature"] = unify_feature_names(plot_df["feature"].tolist())
+    top = plot_df.head(top_n)
 
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.barh(range(len(top)), top["importance"].values[::-1])
     ax.set_yticks(range(len(top)))
     ax.set_yticklabels(top["feature"].values[::-1], fontsize=9)
     ax.set_xlabel("Mean |Gradient|")
-    ax.set_title(f"DKL Gradient Attribution (top {top_n} features)")
+    ax.set_title(f"Top {top_n} Features -- DKL Gradient Attribution")
     plt.tight_layout()
 
-    path = results_dir / "dkl_gradient_attribution.png"
-    fig.savefig(path, dpi=150)
+    for fmt in ("pdf", "png"):
+        path = results_dir / f"dkl_gradient_attribution.{fmt}"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"  Saved → {path}")
     plt.close(fig)
-    print(f"  Saved gradient attribution plot → {path}")
 
 
 def plot_shap_summary(
@@ -444,29 +520,33 @@ def plot_shap_summary(
     X_explain: np.ndarray,
     feature_names: list[str],
     results_dir: Path,
-    top_n: int = 25,
+    top_n: int = 20,
 ) -> None:
     """Plot and save a SHAP beeswarm summary plot."""
     import shap
+
+    # Apply unified naming for display
+    display_names = unify_feature_names(feature_names)
 
     fig, ax = plt.subplots(figsize=(10, 8))
     shap.summary_plot(
         shap_values,
         X_explain,
-        feature_names=feature_names,
+        feature_names=display_names,
         max_display=top_n,
         show=False,
     )
     plt.tight_layout()
 
-    path = results_dir / "dkl_shap_summary.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
+    for fmt in ("pdf", "png"):
+        path = results_dir / f"dkl_shap_summary.{fmt}"
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"  Saved → {path}")
     plt.close("all")
-    print(f"  Saved SHAP summary plot → {path}")
 
     # Also save a bar plot of mean |SHAP|
     mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    shap_df = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs_shap})
+    shap_df = pd.DataFrame({"feature": display_names, "mean_abs_shap": mean_abs_shap})
     shap_df = shap_df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
 
     fig2, ax2 = plt.subplots(figsize=(10, 8))
@@ -475,13 +555,14 @@ def plot_shap_summary(
     ax2.set_yticks(range(len(top)))
     ax2.set_yticklabels(top["feature"].values[::-1], fontsize=9)
     ax2.set_xlabel("Mean |SHAP value|")
-    ax2.set_title(f"DKL SHAP Feature Importance (top {top_n} features)")
+    ax2.set_title(f"Top {top_n} Features -- DKL SHAP Feature Importance")
     plt.tight_layout()
 
-    path2 = results_dir / "dkl_shap_bar.png"
-    fig2.savefig(path2, dpi=150)
+    for fmt in ("pdf", "png"):
+        path2 = results_dir / f"dkl_shap_bar.{fmt}"
+        fig2.savefig(path2, dpi=150, bbox_inches="tight")
+        print(f"  Saved → {path2}")
     plt.close(fig2)
-    print(f"  Saved SHAP bar plot → {path2}")
 
 
 def run_feature_importance(
@@ -513,10 +594,15 @@ def run_feature_importance(
     # --- Gradient attribution ---
     print("  [3/4] Computing gradient attribution...")
     grad_df = compute_gradient_attribution(model, X, feature_names)
-    grad_df.to_csv(results_dir / "dkl_gradient_attribution.csv", index=False)
+
+    # Save CSV with unified names
+    grad_df_unified = grad_df.copy()
+    grad_df_unified["feature"] = unify_feature_names(grad_df_unified["feature"].tolist())
+    grad_df_unified.to_csv(results_dir / "dkl_gradient_attribution.csv", index=False)
+
     plot_gradient_attribution(grad_df, results_dir)
     print("\n  Top 10 features by gradient attribution:")
-    for i, row in grad_df.head(10).iterrows():
+    for i, row in grad_df_unified.head(10).iterrows():
         print(f"    {i + 1:2d}. {row['feature']:40s} {row['importance']:.6f}")
 
     # --- SHAP ---
@@ -524,8 +610,9 @@ def run_feature_importance(
     shap_values, X_explain = compute_shap_values(model, X, feature_names)
     plot_shap_summary(shap_values, X_explain, feature_names, results_dir)
 
+    display_names = unify_feature_names(feature_names)
     mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    shap_df = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs_shap})
+    shap_df = pd.DataFrame({"feature": display_names, "mean_abs_shap": mean_abs_shap})
     shap_df = shap_df.sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
     shap_df.to_csv(results_dir / "dkl_shap_importance.csv", index=False)
 
