@@ -333,21 +333,29 @@ def compute_gradient_attribution(
     )
     X_scaled = model.x_scaler.transform(X_clean).astype(np.float32)
 
-    X_tensor = torch.tensor(X_scaled, dtype=torch.float32, requires_grad=True).to(
-        model.device
-    )
-
     model.model.eval()
     model.likelihood.eval()
 
     import gpytorch as gpy
 
-    with gpy.settings.fast_pred_var():
-        pred_dist = model.likelihood(model.model(X_tensor))
-        pred_mean = pred_dist.mean
+    batch_size = model.predict_batch_size
+    all_grads = []
 
-    pred_mean.sum().backward()
-    grads = X_tensor.grad.detach().cpu().numpy()  # (N, D)
+    for start in range(0, len(X_scaled), batch_size):
+        stop = start + batch_size
+        xb = torch.tensor(
+            X_scaled[start:stop], dtype=torch.float32, device=model.device,
+        )
+        xb.requires_grad_(True)
+
+        with gpy.settings.fast_pred_var():
+            pred_dist = model.likelihood(model.model(xb))
+            pred_mean = pred_dist.mean
+
+        pred_mean.sum().backward()
+        all_grads.append(xb.grad.detach().cpu().numpy())
+
+    grads = np.concatenate(all_grads, axis=0)  # (N, D)
 
     # Mean absolute gradient per feature
     importance = np.abs(grads).mean(axis=0)
